@@ -71,7 +71,14 @@ someone types a username in, and it stores what it finds on that person's own de
   play a move on the board, and the engine grades it — a move it rates within half a pawn
   of its own choice counts as right. Positions you miss come back sooner (a five-box
   spaced-repetition ladder at 0/1/3/7/21 days); two clean finds in a row retires one.
+- **Openings**: an opening-habits scorecard built from the PGNs alone (how often you castle
+  and when, early queen sorties, pieces developed by move 10, central pawns, one piece
+  shuffled repeatedly), a per-opening record showing the move where you personally leave
+  known theory and what the book plays there, and a drill that plays real theory back at you
+  move by move, naming the variation as you go. Every book deviation is cross-checked against
+  the engine, so a sound unnamed transposition is reported as a naming gap, never as an error.
 - Results are saved on the device, so a game is only ever analysed once
+- The header shows when it last synced and whether anything new arrived
 
 ## Layout
 
@@ -82,6 +89,8 @@ app/
   js/app.js             views, routing, replay, coach UI
   js/analysis.js        Stockfish pipeline (port of chess_review.py) + explanations
   js/trainer.js         puzzle queue and spaced repetition
+  js/openings.js        opening book lookup, habits, per-opening report
+  vendor/openings.json  3,810 named openings (lichess chess-openings, CC0)
   js/chesscom.js        Chess.com API + month caching
   js/board.js           board renderer and arrows
   js/db.js              IndexedDB wrapper

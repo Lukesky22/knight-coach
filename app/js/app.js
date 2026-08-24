@@ -8,6 +8,7 @@ import {
   getEngine, MATE_CP, THRESHOLD,
 } from './analysis.js';
 import { buildQueue, gradeCard, getProgress, saveProgress, stats } from './trainer.js';
+import { loadBook, bookAt, bookExit, pickBookMove, habitReport, openingReport } from './openings.js';
 import { Chess } from '../vendor/chess.js';
 
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -42,16 +43,31 @@ async function loadAccount() {
   view.innerHTML = `<div class="center-note">Loading your games…</div>`;
   for (const [uuid, a] of await idbGetAll('analyses')) S.analyses.set(uuid, a);
   S.progress = await getProgress();
+  const before = S.games.length ? S.games.length : null;
+  S.syncError = null;
   try {
     S.games = await syncGames(S.user, (i, n) => {
       view.innerHTML = `<div class="center-note">Fetching archives ${i}/${n}…</div>`;
     });
     S.offline = false;
+    S.lastSync = Date.now();
+    S.newGames = before === null ? 0 : Math.max(0, S.games.length - before);
+    localStorage.setItem('kc.lastSync', String(S.lastSync));
   } catch (err) {
     console.error(err);
     S.games = await loadCachedGames(S.user);
     S.offline = true;
+    S.syncError = err.message;
   }
+}
+
+function agoText(ts) {
+  if (!ts) return 'never';
+  const secs = Math.round((Date.now() - ts) / 1000);
+  if (secs < 60) return 'just now';
+  if (secs < 3600) return `${Math.round(secs / 60)} min ago`;
+  if (secs < 86400) return `${Math.round(secs / 3600)} h ago`;
+  return `${Math.round(secs / 86400)} d ago`;
 }
 
 function route() {
@@ -59,6 +75,8 @@ function route() {
   const m = location.hash.match(/^#g\/(.+)$/);
   if (m) renderGame(decodeURIComponent(m[1]));
   else if (location.hash === '#train') renderTrain();
+  else if (location.hash === '#openings') renderOpenings();
+  else if (location.hash === '#drill') renderDrill();
   else renderHome();
 }
 
@@ -221,7 +239,11 @@ function renderHome() {
     <header class="top">
       <div>
         <h1>♞ Knight Coach</h1>
-        <div class="sub">${esc(S.user)} · ${g.length} games${S.offline ? ' · offline (cached)' : ''}</div>
+        <div class="sub" id="sync-state">${esc(S.user)} · ${g.length} games · ${
+          S.offline
+            ? `offline, showing cached data`
+            : `synced ${agoText(S.lastSync)}${S.newGames ? ` · ${S.newGames} new` : ''}`
+        }</div>
       </div>
       <button id="sync" class="btn small">Sync</button>
     </header>
@@ -254,6 +276,12 @@ function renderHome() {
     </div>
 
     ${trainCard()}
+
+    <div class="card">
+      <h2>Openings</h2>
+      <p class="sub">Your habits, where you leave theory, and a drill for each opening you play.</p>
+      <a class="btn primary block" href="#openings">Coach my openings</a>
+    </div>
 
     ${coachNotes()}
 
@@ -290,7 +318,19 @@ function renderHome() {
       <a href="#" id="switch">Switch account</a>
     </div>`;
 
-  $('#sync').onclick = async () => { await loadAccount(); route(); };
+  $('#sync').onclick = async () => {
+    const btn = $('#sync');
+    btn.disabled = true;
+    btn.textContent = 'Syncing…';
+    await loadAccount();
+    renderHome();
+    const state = $('#sync-state');
+    if (state) {
+      state.textContent = S.offline
+        ? `Sync failed: ${S.syncError || 'no connection'} — showing cached data`
+        : `${S.user} · ${S.games.length} games · ${S.newGames ? `${S.newGames} new game${S.newGames === 1 ? '' : 's'}` : 'already up to date'}`;
+    }
+  };
   $('#switch').onclick = (e) => {
     e.preventDefault();
     localStorage.removeItem('kc.user');
@@ -592,6 +632,244 @@ function renderGame(uuid) {
   renderAnalyzeArea();
   renderCoach();
   goTo(0);
+}
+
+// ---------------------------------------------------------------- openings
+
+async function renderOpenings() {
+  $('#view').innerHTML = `
+    <header class="top">
+      <a class="btn small" href="#">←</a>
+      <div><h1>Openings</h1><div class="sub">${S.games.length} games</div></div>
+      <span></span>
+    </header>
+    <div class="center-note">Reading your openings…</div>`;
+
+  await loadBook();
+  const habits = habitReport(S.games);
+  const report = openingReport(S.games, S.analyses);
+
+  // Where do YOU leave known theory, and what does the book play instead?
+  // Group identical departures so a habit shows up as a repeated one.
+  const exits = new Map();
+  for (const g of S.games) {
+    const family = g.opening.split(' ').slice(0, 2).join(' ');
+    try {
+      const c = new Chess();
+      c.loadPgn(g.pgn);
+      const exit = bookExit(c.history(), g.myColor);
+      if (!exit) continue;
+      // A named-opening book is not a list of every good move: plenty of sound
+      // moves are simply unnamed transpositions. Ask the engine what the move
+      // actually cost before calling it a problem.
+      const a = S.analyses.get(g.uuid);
+      const rec = a ? a.records[exit.ply] : null;
+      const bucket = exits.get(family) || { plies: [], spots: new Map() };
+      bucket.plies.push(exit.ply);
+      const key = `${exit.line.join(' ')}|${exit.played}`;
+      const spot = bucket.spots.get(key) || { ...exit, count: 0, drops: [] };
+      spot.count++;
+      if (rec && rec.san === exit.played) spot.drops.push(rec.drop);
+      bucket.spots.set(key, spot);
+      exits.set(family, bucket);
+    } catch { /* unparseable game, skip */ }
+  }
+
+  const failing = habits.filter((h) => !h.good);
+
+  $('#view').innerHTML = `
+    <header class="top">
+      <a class="btn small" href="#">←</a>
+      <div><h1>Openings</h1><div class="sub">${S.games.length} games</div></div>
+      <span></span>
+    </header>
+
+    <div class="card">
+      <h2>Opening habits</h2>
+      <p class="sub">These decide far more of your games than knowing theory does.</p>
+      ${habits.map((h) => `
+        <div class="habit ${h.good ? 'ok' : 'bad'}">
+          <div class="habit-head">
+            <b>${esc(h.label)}</b>
+            <span class="habit-val">${esc(h.value)}</span>
+          </div>
+          <div class="sub">${esc(h.detail)}</div>
+        </div>`).join('')}
+      ${failing.length
+        ? `<p class="why">Fix these first: <b>${failing.map((h) => esc(h.label.toLowerCase())).join(', ')}</b>.</p>`
+        : `<p class="why">Your opening habits are sound. Theory is worth studying now.</p>`}
+    </div>
+
+    <div class="card">
+      <div class="row-between"><h2>Drill your openings</h2></div>
+      <p class="sub">Play through real theory move by move. The book replies, you find the next move.</p>
+      <div class="drill-picks">
+        ${report.slice(0, 6).map((o) => `
+          <button class="btn small drill-pick" data-family="${esc(o.family)}">${esc(o.family)}</button>`).join('')}
+        <button class="btn small drill-pick" data-family="">From move 1</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Your openings</h2>
+      ${report.map((o) => {
+        const bucket = exits.get(o.family);
+        const pct = Math.round(o.score * 100);
+        // the departure you have repeated most often in this opening
+        const top = bucket
+          ? [...bucket.spots.values()].sort((a, b) => b.count - a.count)[0]
+          : null;
+        return `
+          <div class="opening-block">
+            <div class="row-between">
+              <b>${esc(o.family)}</b>
+              <span class="sub">${o.W}-${o.L}-${o.D} · ${pct}%</span>
+            </div>
+            <div class="wlbar">
+              <i style="width:${(o.W / o.games) * 100}%"></i><u style="width:${(o.D / o.games) * 100}%"></u>
+            </div>
+            ${top ? (() => {
+              const avgDrop = top.drops.length
+                ? top.drops.reduce((s, x) => s + x, 0) / top.drops.length
+                : null;
+              const costly = avgDrop !== null && avgDrop >= THRESHOLD;
+              const verdict = avgDrop === null
+                ? 'Not analysed yet, so it may be perfectly sound.'
+                : costly
+                  ? `The engine says this costs about ${(avgDrop / 100).toFixed(1)} pawns — worth replacing.`
+                  : 'The engine rates it fine, so this is a naming gap, not a mistake.';
+              return `
+              <div class="deviation ${costly ? 'costly' : ''}">
+                On move ${top.moveNumber}, after <b>${esc(top.line.slice(-4).join(' ') || 'the first move')}</b>,
+                you played <b>${esc(top.played)}</b>${top.count > 1 ? ` (${top.count} times)` : ''}
+                instead of the book's <b>${esc(top.expected.slice(0, 3).join(', '))}</b>.
+                ${esc(verdict)}
+              </div>`;
+            })() : `<div class="sub">You stay in book here.</div>`}
+            <div class="sub">
+              ${o.avgFirstMistake ? `First real mistake around move ${Math.max(1, Math.round(o.avgFirstMistake / 2))}.` : ''}
+              ${o.analysed < o.games ? ` (${o.analysed}/${o.games} analysed)` : ''}
+            </div>
+          </div>`;
+      }).join('')}
+    </div>`;
+
+  for (const b of document.querySelectorAll('.drill-pick')) {
+    b.onclick = () => { S.drillFamily = b.dataset.family; location.hash = '#drill'; };
+  }
+}
+
+// ---------------------------------------------------------------- opening drill
+
+async function renderDrill() {
+  await loadBook(); // may be entered directly by reloading on #drill
+  const family = S.drillFamily || '';
+  // Play the colour you most often have in this opening.
+  const inFamily = S.games.filter((g) => !family || g.opening.startsWith(family));
+  const asWhite = inFamily.filter((g) => g.myColor === 'w').length;
+  const myColor = family && inFamily.length ? (asWhite >= inFamily.length / 2 ? 'w' : 'b') : 'w';
+
+  const chess = new Chess();
+  const sans = [];
+  let done = false;
+
+  $('#view').innerHTML = `
+    <header class="top">
+      <a class="btn small" href="#openings">←</a>
+      <div><h1>${esc(family || 'Opening drill')}</h1><div class="sub" id="d-line"></div></div>
+      <span></span>
+    </header>
+    <div class="card" id="d-prompt"></div>
+    <div class="board-wrap"><div id="board"></div></div>
+    <div id="d-feedback"></div>`;
+
+  const board = new Board($('#board'));
+  board.setFlip(myColor === 'b');
+  const legalFrom = (sq) => chess.moves({ square: sq, verbose: true }).map((m) => m.to);
+
+  function bookMoves() {
+    const all = bookAt(sans).continuations.filter((c) => chess.moves().includes(c.san));
+    if (!family) return all;
+    // inside a chosen opening, only its own continuations count as "the book"
+    const inFamily = all.filter((c) => c.names.some((n) => n.startsWith(family)));
+    return inFamily.length ? inFamily : all;
+  }
+
+  function draw(msg = '') {
+    const info = bookAt(sans);
+    board.position(chess.fen(), {
+      lastMove: sans.length ? lastFromTo : null,
+      arrows: [],
+    });
+    $('#d-line').textContent = sans.length ? sans.join(' ') : 'starting position';
+    const options = bookMoves();
+    if (!options.length || done) {
+      done = true;
+      board.setInteractive(false);
+      $('#d-prompt').innerHTML = `<h2>${esc(info.name || 'Out of book')}</h2>
+        <p class="sub">This is as far as the book goes. From here it is your own chess.</p>`;
+      $('#d-feedback').innerHTML = `<div class="card">
+        <p>You played: <b>${esc(sans.join(' ')) || '(nothing)'}</b></p>
+        <div class="row">
+          <button class="btn primary" id="d-again">Start again</button>
+          <a class="btn small" href="#openings">Back to openings</a>
+        </div></div>`;
+      $('#d-again').onclick = () => renderDrill();
+      return;
+    }
+    $('#d-prompt').innerHTML = `
+      <h2>${esc(info.name || 'Opening drill')}</h2>
+      <p class="sub">${myColor === 'w' ? 'White' : 'Black'} to play — find a move theory plays here.
+      ${options.length} known continuation${options.length === 1 ? '' : 's'}.</p>`;
+    $('#d-feedback').innerHTML = msg;
+    board.setInteractive(true, { legalFrom, onMove: attempt });
+  }
+
+  let lastFromTo = null;
+
+  function replyFromBook() {
+    const pick = pickBookMove(sans, family);
+    if (!pick || !chess.moves().includes(pick.san)) { done = true; return; }
+    const mv = chess.move(pick.san);
+    sans.push(mv.san);
+    lastFromTo = [mv.from, mv.to];
+  }
+
+  function attempt({ from, to }) {
+    if (done) return;
+    // Work out the book moves while the position is still the one being asked
+    // about; playing first would leave chess.moves() listing the opponent's
+    // replies instead.
+    const options = bookMoves().map((c) => c.san);
+    let mv;
+    try { mv = chess.move({ from, to, promotion: 'q' }); } catch { return; }
+    if (!mv) return;
+
+    const ok = options.includes(mv.san);
+    if (!ok) {
+      chess.undo();
+      draw(`<div class="card bad">
+        <h2>✗ ${esc(mv.san)} is not in the book here.</h2>
+        <p>Theory plays: <b>${options.slice(0, 4).map(esc).join(', ')}</b>.</p>
+        <p class="sub">That does not make your move losing — it just leaves known paths, and at your level that usually means facing prepared opponents without a map.</p>
+      </div>`);
+      return;
+    }
+    sans.push(mv.san);
+    lastFromTo = [mv.from, mv.to];
+    const named = bookAt(sans);
+    board.setInteractive(false);
+    // book plays its reply
+    setTimeout(() => {
+      replyFromBook();
+      draw(`<div class="card good"><h2>✓ ${esc(mv.san)}</h2>
+        <p class="sub">${esc(named.name || 'Still in book')}.</p></div>`);
+    }, 350);
+  }
+
+  // if you are Black, the book opens for White first
+  if (myColor === 'b') replyFromBook();
+  draw();
 }
 
 // ---------------------------------------------------------------- trainer

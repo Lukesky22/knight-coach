@@ -220,3 +220,24 @@ line.arrow-played, polygon.arrow-played { stroke: #c33; fill: #c33; }
 .card.good h2 { color: var(--green); }
 .card.bad h2 { color: var(--red); }
 #t-feedback .row { margin-top: 10px; }
+
+/* ---------- openings ---------- */
+.habit { padding: 8px 0; border-bottom: 1px solid #232936; }
+.habit:last-of-type { border-bottom: none; }
+.habit-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.habit-val { font-size: 0.85rem; font-weight: 600; }
+.habit.ok .habit-val { color: var(--green); }
+.habit.bad .habit-val { color: var(--orange); }
+.habit.bad b::before { content: '! '; color: var(--orange); }
+
+.drill-picks { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.opening-block { padding: 10px 0; border-bottom: 1px solid #232936; }
+.opening-block:last-child { border-bottom: none; }
+.opening-block .wlbar { margin: 6px 0 4px; }
+.deviation {
+  font-size: 0.85rem; line-height: 1.5; margin: 6px 0 4px;
+  padding: 8px 10px; background: var(--card2); border-radius: 8px;
+  border-left: 3px solid var(--sub);
+}
+.deviation.costly { border-left-color: var(--orange); }
+#d-line { font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60vw; }
