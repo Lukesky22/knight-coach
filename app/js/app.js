@@ -3,7 +3,12 @@
 import { idbGet, idbPut, idbGetAll } from './db.js';
 import { getProfile, syncGames, loadCachedGames } from './chesscom.js';
 import { Board } from './board.js';
-import { analyzeGame, parseGame, fmtEval, isMateScore, MATE_CP, THRESHOLD } from './analysis.js';
+import {
+  analyzeGame, parseGame, fmtEval, isMateScore, explainMistake, dropDescription,
+  getEngine, MATE_CP, THRESHOLD,
+} from './analysis.js';
+import { buildQueue, gradeCard, getProgress, saveProgress, stats } from './trainer.js';
+import { Chess } from '../vendor/chess.js';
 
 const $ = (sel, el = document) => el.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
@@ -16,6 +21,8 @@ const S = {
   games: [],
   analyses: new Map(), // uuid -> analysis result
   bulk: null,          // AbortController while "analyze all" runs
+  offline: false,
+  progress: null,      // trainer spaced-repetition state
 };
 
 const SEV_LABEL = { blunder: 'Blunder', mistake: 'Mistake', inaccuracy: 'Inaccuracy' };
@@ -34,6 +41,7 @@ async function loadAccount() {
   const view = $('#view');
   view.innerHTML = `<div class="center-note">Loading your games…</div>`;
   for (const [uuid, a] of await idbGetAll('analyses')) S.analyses.set(uuid, a);
+  S.progress = await getProgress();
   try {
     S.games = await syncGames(S.user, (i, n) => {
       view.innerHTML = `<div class="center-note">Fetching archives ${i}/${n}…</div>`;
@@ -50,6 +58,7 @@ function route() {
   if (!S.user) { renderSetup(); return; }
   const m = location.hash.match(/^#g\/(.+)$/);
   if (m) renderGame(decodeURIComponent(m[1]));
+  else if (location.hash === '#train') renderTrain();
   else renderHome();
 }
 
@@ -114,6 +123,7 @@ function coachNotes() {
   const phase = { opening: 0, middlegame: 0, endgame: 0 };
   const perOpening = new Map();
   let flaggedTotal = 0, acplSum = 0;
+  let serious = 0, punishedAtOnce = 0;
   const acplByGame = [];
   for (const g of analyzed) {
     const a = S.analyses.get(g.uuid);
@@ -122,6 +132,15 @@ function coachNotes() {
     const bad = a.records.filter((r) => r.mover === g.myColor && r.severity);
     flaggedTotal += bad.length;
     for (const r of bad) phase[r.phase]++;
+    // How often does the very next move punish the mistake? A capture or check
+    // straight back means it was a hanging piece, not a subtle positional slip.
+    for (let i = 0; i < a.records.length; i++) {
+      const r = a.records[i];
+      if (r.mover !== g.myColor || !r.severity || r.severity === 'inaccuracy') continue;
+      serious++;
+      const reply = a.records[i + 1];
+      if (reply && /x|\+|#/.test(reply.san)) punishedAtOnce++;
+    }
     // Group by opening family ("Sicilian Defense Chekhover Variation" ->
     // "Sicilian Defense") so each bucket has enough games to mean something.
     const family = g.opening.split(' ').slice(0, 2).join(' ');
@@ -136,12 +155,19 @@ function coachNotes() {
     const worstPhase = Object.entries(phase).sort((a, b) => b[1] - a[1])[0];
     notes.push(`Most of your mistakes come in the <b>${worstPhase[0]}</b> (${Math.round((worstPhase[1] / flaggedTotal) * 100)}% of ${flaggedTotal} flagged moves).`);
   }
+  if (serious) {
+    const pct = Math.round((punishedAtOnce / serious) * 100);
+    notes.push(`<b>${pct}% of your serious mistakes are punished by your opponent's very next move</b> — a capture or a check. These are hanging pieces, not deep positional errors.`);
+  }
+  // Only call an opening a leak if it is meaningfully worse than your own
+  // baseline; your most-played opening will otherwise always "win".
+  const avgBad = serious / analyzed.length;
   const leaky = [...perOpening.entries()]
-    .filter(([, o]) => o.games >= 4)
+    .filter(([, o]) => o.games >= 5 && o.bad / o.games > avgBad * 1.25)
     .sort((a, b) => b[1].bad / b[1].games - a[1].bad / a[1].games)[0];
   if (leaky) {
     const per = (leaky[1].bad / leaky[1].games).toFixed(1);
-    notes.push(`Biggest leak: <b>${esc(leaky[0])}</b> — ${per} serious mistakes per game across ${leaky[1].games} games.`);
+    notes.push(`<b>${esc(leaky[0])}</b> goes worse than your average: ${per} serious mistakes per game over ${leaky[1].games} games, against ${avgBad.toFixed(1)} normally.`);
   }
   if (acplByGame.length >= 6) {
     acplByGame.sort((a, b) => a.t - b.t);
@@ -152,6 +178,26 @@ function coachNotes() {
     else if (late > early + 5) notes.push(`Recent games are sloppier: ACPL rose from ${early} to ${late}. Slow down.`);
   }
   return `<div class="card"><h2>Coach's notes</h2><ul class="notes">${notes.map((n) => `<li>${n}</li>`).join('')}</ul></div>`;
+}
+
+function trainCard() {
+  if (!S.progress) return '';
+  const s = stats(S.games, S.analyses, S.progress);
+  if (!s.total) return '';
+  const due = buildQueue(S.games, S.analyses, S.progress, { now: Date.now() }).length;
+  const pct = s.total ? Math.round((s.retired / s.total) * 100) : 0;
+  return `
+    <div class="card train-card">
+      <div class="row-between">
+        <h2>Training</h2>
+        <span class="sub">${s.retired}/${s.total} mastered</span>
+      </div>
+      <p class="sub">Your own blunders, served back as puzzles. Find the move you missed.</p>
+      <div class="progress"><div style="width:${pct}%"></div></div>
+      <a class="btn primary block" href="#train">
+        ${due ? `Train ${due} position${due === 1 ? '' : 's'}` : 'Nothing due — practise anyway'}
+      </a>
+    </div>`;
 }
 
 function renderHome() {
@@ -206,6 +252,8 @@ function renderHome() {
       <div id="bulk-status" class="sub"></div>
       <div class="progress" id="bulk-bar-wrap" ${S.bulk ? '' : 'hidden'}><div id="bulk-bar"></div></div>
     </div>
+
+    ${trainCard()}
 
     ${coachNotes()}
 
@@ -483,14 +531,6 @@ function renderGame(uuid) {
     };
   }
 
-  function dropText(r) {
-    if (isMateScore(r.before) || isMateScore(r.after)) {
-      if (isMateScore(r.before) && r.before > 0 === (r.mover === 'w')) return 'missed a mate';
-      return 'allowed a mate';
-    }
-    return `lost ${(r.drop / 100).toFixed(2)} pawns`;
-  }
-
   function renderCoach() {
     const coach = $('#coach');
     if (!analysis) { coach.innerHTML = ''; return; }
@@ -513,8 +553,8 @@ function renderGame(uuid) {
               <b>${esc(r.label)} ${esc(r.san)}</b>
               <span class="sev ${r.severity}">${SEV_LABEL[r.severity]}</span>
             </div>
-            <div class="sub">${dropText(r)} · eval ${fmtEval(r.before)} → ${fmtEval(r.after)} · ${r.phase}</div>
-            ${r.bestLine ? `<div class="bestline">Best was: <b>${esc(r.bestLine)}</b></div>` : ''}
+            <div class="sub">${dropDescription(r)} · eval ${fmtEval(r.before)} → ${fmtEval(r.after)} · ${r.phase}</div>
+            <div class="why">${esc(explainMistake(r, analysis.records[r.i] || null))}</div>
           </div>`).join('')
         : `<p class="sub">No moves lost ${THRESHOLD}+ centipawns. Clean game — nice.</p>`}
       </div>`;
@@ -552,6 +592,131 @@ function renderGame(uuid) {
   renderAnalyzeArea();
   renderCoach();
   goTo(0);
+}
+
+// ---------------------------------------------------------------- trainer
+
+// A puzzle has one engine answer, but chess usually offers several good moves.
+// Accept anything that keeps the evaluation within this many centipawns.
+const NEAR_ENOUGH = 50;
+
+async function renderTrain() {
+  let queue = buildQueue(S.games, S.analyses, S.progress, { now: Date.now() });
+  if (!queue.length) {
+    // nothing scheduled: fall back to a free practice run over everything
+    queue = buildQueue(S.games, S.analyses, S.progress, { now: 0 });
+  }
+  if (!queue.length) {
+    $('#view').innerHTML = `
+      <header class="top"><a class="btn small" href="#">←</a><h1>Training</h1><span></span></header>
+      <div class="card center-note">Analyze some games first and your mistakes will show up here as puzzles.</div>`;
+    return;
+  }
+
+  let pos = 0;
+  let answered = false;
+  let right = 0, wrong = 0;
+
+  $('#view').innerHTML = `
+    <header class="top">
+      <a class="btn small" href="#">←</a>
+      <div><h1>Training</h1><div class="sub" id="t-count"></div></div>
+      <div class="sub" id="t-score"></div>
+    </header>
+    <div class="card" id="t-prompt"></div>
+    <div class="board-wrap"><div id="board"></div></div>
+    <div id="t-feedback"></div>`;
+
+  const board = new Board($('#board'));
+  let chess = null;
+  let puzzle = null;
+
+  const legalFrom = (sq) => (chess ? chess.moves({ square: sq, verbose: true }).map((m) => m.to) : []);
+
+  function show() {
+    puzzle = queue[pos];
+    answered = false;
+    const r = puzzle.record;
+    chess = new Chess(r.fenBefore);
+    board.setFlip(puzzle.myColor === 'b');
+    board.position(r.fenBefore, { lastMove: null, arrows: [] });
+    board.setInteractive(true, { legalFrom, onMove: attempt });
+
+    $('#t-count').textContent = `${pos + 1} of ${queue.length}`;
+    $('#t-score').textContent = right + wrong ? `${right} right · ${wrong} wrong` : '';
+    $('#t-prompt').innerHTML = `
+      <h2>${puzzle.myColor === 'w' ? 'White' : 'Black'} to play — find the move</h2>
+      <p class="sub">From your game against ${esc(puzzle.oppName)} (${esc(puzzle.opening)}).
+      You went wrong here and it ${dropDescription(r)}.</p>`;
+    $('#t-feedback').innerHTML = '';
+  }
+
+  async function attempt({ from, to }) {
+    if (answered) return;
+    let mv;
+    try {
+      mv = chess.move({ from, to, promotion: 'q' });
+    } catch { return; }
+    if (!mv) return;
+    answered = true;
+    board.setInteractive(false);
+    board.position(chess.fen(), { lastMove: [from, to], arrows: [] });
+
+    const r = puzzle.record;
+    const best = r.bestUci;
+    const played = `${from}${to}`;
+    let correct = best && (played === best.slice(0, 4));
+    let verdict = '';
+
+    if (correct) {
+      verdict = 'Exactly right.';
+    } else {
+      $('#t-feedback').innerHTML = `<div class="card sub">Checking your move…</div>`;
+      try {
+        const eng = await getEngine();
+        const info = await eng.evalPosition(chess.fen(), 12);
+        // score is from the new side-to-move's view; flip to yours
+        const mine = info.type === 'mate'
+          ? (info.value > 0 ? -(MATE_CP - info.value) : MATE_CP + info.value)
+          : -info.value;
+        const lost = (r.mover === 'w' ? r.before : -r.before) - mine;
+        if (isMateScore(mine) && mine < 0) {
+          verdict = `That runs into a forced mate in ${MATE_CP - Math.abs(mine)}.`;
+        } else if (lost <= NEAR_ENOUGH) {
+          correct = true;
+          verdict = `Good move — the engine rates ${mv.san} about as highly as its own choice.`;
+        } else {
+          verdict = `${mv.san} loses about ${(lost / 100).toFixed(1)} pawns.`;
+        }
+      } catch {
+        verdict = 'Not the move.';
+      }
+    }
+
+    gradeCard(S.progress, puzzle.id, correct, Date.now());
+    await saveProgress(S.progress);
+    if (correct) right++; else wrong++;
+    $('#t-score').textContent = `${right} right · ${wrong} wrong`;
+
+    const bestSan = r.bestLine ? r.bestLine.replace(/^\d+\.+\s*/, '').split(' ')[0] : '?';
+    $('#t-feedback').innerHTML = `
+      <div class="card ${correct ? 'good' : 'bad'}">
+        <h2>${correct ? '✓ ' : '✗ '}${esc(verdict)}</h2>
+        ${correct ? '' : `<p>The move was <b>${esc(bestSan)}</b>.</p>`}
+        <p class="sub" style="margin-top:8px">In the game you played <b>${esc(r.san)}</b>:</p>
+        <p class="why">${esc(explainMistake(r, puzzle.next))}</p>
+        <div class="row">
+          <button class="btn primary" id="t-next">${pos + 1 < queue.length ? 'Next position' : 'Finish'}</button>
+          <a class="btn small" href="#g/${encodeURIComponent(puzzle.gameUuid)}">See the game</a>
+        </div>
+      </div>`;
+    $('#t-next').onclick = () => {
+      if (pos + 1 < queue.length) { pos++; show(); }
+      else location.hash = '';
+    };
+  }
+
+  show();
 }
 
 // ---------------------------------------------------------------- go

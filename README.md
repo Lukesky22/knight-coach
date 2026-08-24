@@ -61,8 +61,16 @@ someone types a username in, and it stores what it finds on that person's own de
 - **Analyze**: Stockfish evaluates every position; any move losing 80+ centipawns is flagged
   as inaccuracy / mistake / blunder, sorted worst-first, with the line you should have played
 - Red arrow = what you played, green arrow = what Stockfish wanted
+- Every flagged move gets a plain-English reason, derived from the engine's own refutation
+  rather than from any language model: which piece hangs, what recaptures, what gets forked,
+  what the forced mate is
 - Coach's notes across all analysed games: average centipawn loss, which phase of the game
-  you err in most, and which openings leak the most points
+  you err in most, how often your mistakes are punished immediately, and whether an opening
+  really does go worse than your own baseline
+- **Training**: your own blunders served back as puzzles. The position comes up cold, you
+  play a move on the board, and the engine grades it — a move it rates within half a pawn
+  of its own choice counts as right. Positions you miss come back sooner (a five-box
+  spaced-repetition ladder at 0/1/3/7/21 days); two clean finds in a row retires one.
 - Results are saved on the device, so a game is only ever analysed once
 
 ## Layout
@@ -72,7 +80,8 @@ app/
   index.html            shell
   css/app.css           all styling
   js/app.js             views, routing, replay, coach UI
-  js/analysis.js        Stockfish pipeline (port of chess_review.py)
+  js/analysis.js        Stockfish pipeline (port of chess_review.py) + explanations
+  js/trainer.js         puzzle queue and spaced repetition
   js/chesscom.js        Chess.com API + month caching
   js/board.js           board renderer and arrows
   js/db.js              IndexedDB wrapper

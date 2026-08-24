@@ -11,16 +11,32 @@ export class Board {
     this.lastMove = null; // [from, to]
     this.arrows = [];     // [{from, to, kind: 'best'|'played'}]
 
+    // Interaction, off by default: the replay board is display-only, the
+    // trainer board lets you play a move.
+    this.interactive = false;
+    this.legalFrom = null;   // (square) => [destination squares]
+    this.onMove = null;      // ({from, to}) => void
+    this.selected = null;
+
     el.classList.add('board');
     this.squares = {};
     for (let row = 0; row < 8; row++) {
       for (let col = 0; col < 8; col++) {
         const sq = document.createElement('div');
         sq.className = `sq ${(row + col) % 2 ? 'dark' : 'light'}`;
+        sq.dataset.row = row;
+        sq.dataset.col = col;
         el.appendChild(sq);
         this.squares[`${row},${col}`] = sq;
       }
     }
+
+    el.addEventListener('click', (e) => {
+      if (!this.interactive) return;
+      const cell = e.target.closest('.sq');
+      if (!cell) return;
+      this.handleClick(this.squareAt(+cell.dataset.row, +cell.dataset.col));
+    });
     this.pieceLayer = document.createElement('div');
     this.pieceLayer.className = 'piece-layer';
     el.appendChild(this.pieceLayer);
@@ -45,6 +61,40 @@ export class Board {
       : { row: 7 - rank, col: file };
   }
 
+  // the inverse: display coordinates -> "e4"
+  squareAt(row, col) {
+    return this.flip
+      ? `${FILES[7 - col]}${row + 1}`
+      : `${FILES[col]}${8 - row}`;
+  }
+
+  setInteractive(on, { legalFrom, onMove } = {}) {
+    this.interactive = on;
+    this.el.classList.toggle('interactive', on);
+    if (legalFrom) this.legalFrom = legalFrom;
+    if (onMove) this.onMove = onMove;
+    this.selected = null;
+    this.render();
+  }
+
+  handleClick(sq) {
+    // second click: if it completes a legal move, play it
+    if (this.selected) {
+      const dests = this.legalFrom ? this.legalFrom(this.selected) : [];
+      if (dests.includes(sq)) {
+        const from = this.selected;
+        this.selected = null;
+        this.render();
+        if (this.onMove) this.onMove({ from, to: sq });
+        return;
+      }
+    }
+    // otherwise treat it as picking up a piece (or clearing the selection)
+    const canMove = this.legalFrom && this.legalFrom(sq).length > 0;
+    this.selected = canMove && sq !== this.selected ? sq : null;
+    this.render();
+  }
+
   position(fen, { lastMove = null, arrows = [] } = {}) {
     this.fen = fen;
     this.lastMove = lastMove;
@@ -53,11 +103,21 @@ export class Board {
   }
 
   render() {
-    for (const sq of Object.values(this.squares)) sq.classList.remove('hl');
+    for (const sq of Object.values(this.squares)) {
+      sq.classList.remove('hl', 'sel', 'dest');
+    }
     if (this.lastMove) {
       for (const s of this.lastMove) {
         const { row, col } = this.coords(s);
         this.squares[`${row},${col}`].classList.add('hl');
+      }
+    }
+    if (this.selected) {
+      const s = this.coords(this.selected);
+      this.squares[`${s.row},${s.col}`].classList.add('sel');
+      for (const d of this.legalFrom(this.selected)) {
+        const c = this.coords(d);
+        this.squares[`${c.row},${c.col}`].classList.add('dest');
       }
     }
 

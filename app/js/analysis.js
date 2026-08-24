@@ -1,4 +1,4 @@
-// In-browser port of chess_review.py:
+﻿// In-browser port of chess_review.py:
 //   1. replay the PGN
 //   2. Stockfish (WASM worker) evaluates every position at fixed depth
 //   3. drop = cp lost by the mover (White's viewpoint), flag if >= THRESHOLD
@@ -108,6 +108,18 @@ export function isMateScore(cp) {
   return Math.abs(cp) >= MATE_CP - 500;
 }
 
+// How much a move cost, in words. Mate scores are huge sentinel integers, so
+// they must never be printed as a number of pawns.
+export function dropDescription(rec) {
+  const mateBefore = isMateScore(rec.before);
+  const mateAfter = isMateScore(rec.after);
+  if (mateBefore || mateAfter) {
+    const hadMate = mateBefore && (rec.before > 0 === (rec.mover === 'w'));
+    return hadMate ? 'threw away a forced mate' : 'allowed a forced mate';
+  }
+  return `cost you ${(rec.drop / 100).toFixed(1)} pawns`;
+}
+
 export function severity(rec) {
   if (rec.drop < THRESHOLD) return null;
   const mate = isMateScore(rec.before) || isMateScore(rec.after);
@@ -116,7 +128,7 @@ export function severity(rec) {
   return 'inaccuracy';
 }
 
-// "opening" | "middlegame" | "endgame" — simple heuristic used for coach stats
+// "opening" | "middlegame" | "endgame" - simple heuristic used for coach stats
 function phaseOf(fen, fullmove) {
   if (fullmove <= 10) return 'opening';
   const pieces = fen.split(' ')[0].replace(/[^nbrqNBRQ]/g, '').length;
@@ -142,6 +154,129 @@ function pvToSan(fen, pv, maxMoves) {
     else parts.push(mv.san);
   }
   return parts.join(' ');
+}
+
+// ---------- explaining WHY a move was bad ----------
+
+const VALUE = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
+const NAME = { p: 'pawn', n: 'knight', b: 'bishop', r: 'rook', q: 'queen', k: 'king' };
+
+function material(fen) {
+  const board = fen.split(' ')[0];
+  let w = 0, b = 0;
+  for (const ch of board) {
+    const v = VALUE[ch.toLowerCase()];
+    if (v === undefined) continue;
+    if (ch === ch.toUpperCase()) w += v; else b += v;
+  }
+  return { w, b };
+}
+
+// After `mv` lands on a square, does the piece now standing there attack two or
+// more valuable enemy pieces? That's a fork.
+//
+// The refutation has already been played, so it is the victim's turn and
+// chess.js would enumerate the wrong side's moves. Hand it back a copy of the
+// position with the turn flipped so we can ask what the mover threatens.
+function forkTargets(fenAfterRefutation, toSquare) {
+  const parts = fenAfterRefutation.split(' ');
+  parts[1] = parts[1] === 'w' ? 'b' : 'w';
+  parts[3] = '-'; // an en-passant square is meaningless once the turn flips
+  let probe;
+  try {
+    probe = new Chess(parts.join(' '));
+  } catch {
+    return [];
+  }
+  const targets = [];
+  for (const m of probe.moves({ verbose: true })) {
+    if (m.from === toSquare && m.captured && VALUE[m.captured] >= 3) {
+      targets.push(m.captured);
+    }
+  }
+  return targets;
+}
+
+/**
+ * Plain-English reason a flagged move was bad, derived from the engine's own
+ * refutation rather than from any language model.
+ *
+ * @param rec   the flagged record
+ * @param next  the record for the opponent's reply (holds the refutation PV
+ *              and the position immediately after `rec` was played)
+ */
+export function explainMistake(rec, next) {
+  const better = rec.bestLine ? ` Instead ${rec.bestLine.replace(/^\d+\.+\s*/, '')} holds.` : '';
+
+  if (isMateScore(rec.after)) {
+    const moverIsWinning = rec.after > 0 === (rec.mover === 'w');
+    const n = MATE_CP - Math.abs(rec.after);
+    if (!moverIsWinning) {
+      const line = next?.bestLine ? ` The finish is ${next.bestLine.replace(/^\d+\.+\s*/, '')}.` : '';
+      return `This walks into forced mate in ${n}.${line}${better}`;
+    }
+  }
+  if (isMateScore(rec.before)) {
+    const hadMate = rec.before > 0 === (rec.mover === 'w');
+    if (hadMate) return `You had a forced mate here and let it slip.${better}`;
+  }
+
+  if (!next || !next.bestUci) {
+    return `This drops ${(rec.drop / 100).toFixed(1)} pawns of advantage.${better}`;
+  }
+
+  // Replay the engine's refutation on the position left after the played move.
+  let chess, refMove;
+  try {
+    chess = new Chess(next.fenBefore);
+    refMove = chess.move({
+      from: next.bestUci.slice(0, 2),
+      to: next.bestUci.slice(2, 4),
+      promotion: next.bestUci[4] || 'q',
+    });
+  } catch {
+    return `This drops ${(rec.drop / 100).toFixed(1)} pawns.${better}`;
+  }
+  if (!refMove) return `This drops ${(rec.drop / 100).toFixed(1)} pawns.${better}`;
+
+  const mine = rec.mover === 'w' ? 'w' : 'b';
+  const before = material(next.fenBefore);
+  const myMatBefore = mine === 'w' ? before.w : before.b;
+
+  // Look for threats before mutating the position any further.
+  const capForks = refMove.captured ? forkTargets(chess.fen(), refMove.to) : [];
+
+  if (refMove.captured) {
+    const piece = NAME[refMove.captured];
+    const recaptures = chess.moves({ verbose: true }).filter((m) => m.to === refMove.to);
+
+    if (!recaptures.length) {
+      return `This hangs your ${piece} on ${refMove.to}: ${refMove.san} simply takes it and nothing can recapture.${better}`;
+    }
+    // You can take back, so weigh the whole trade, not just their capture.
+    // Recapturing with the cheapest piece is the normal choice.
+    const cheapest = recaptures.sort((a, b) => VALUE[a.piece] - VALUE[b.piece])[0];
+    chess.move({ from: cheapest.from, to: cheapest.to, promotion: 'q' });
+    const after = material(chess.fen());
+    const net = myMatBefore - (mine === 'w' ? after.w : after.b);
+
+    if (net >= 2) {
+      return `${refMove.san} wins your ${piece} on ${refMove.to}. Taking back with the ${NAME[cheapest.piece]} still leaves you about ${net} points of material down.${better}`;
+    }
+    if (capForks.length >= 2) {
+      return `${refMove.san} takes the ${piece} and forks your ${NAME[capForks[0]]} and ${NAME[capForks[1]]}, so another piece drops next move.${better}`;
+    }
+    return `${refMove.san} trades on ${refMove.to} with tempo and leaves you ${(rec.drop / 100).toFixed(1)} pawns worse.${better}`;
+  }
+
+  const forks = forkTargets(chess.fen(), refMove.to);
+  if (forks.length >= 2) {
+    return `${refMove.san} hits your ${NAME[forks[0]]} and ${NAME[forks[1]]} at once — you cannot save both.${better}`;
+  }
+  if (refMove.san.includes('+')) {
+    return `${refMove.san} is check, and dealing with it costs you ${(rec.drop / 100).toFixed(1)} pawns.${better}`;
+  }
+  return `The quiet reply ${refMove.san} leaves you ${(rec.drop / 100).toFixed(1)} pawns worse, with no good way to untangle.${better}`;
 }
 
 export function parseGame(pgn) {
