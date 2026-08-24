@@ -61,9 +61,20 @@ someone types a username in, and it stores what it finds on that person's own de
 - **Analyze**: Stockfish evaluates every position; any move losing 80+ centipawns is flagged
   as inaccuracy / mistake / blunder, sorted worst-first, with the line you should have played
 - Red arrow = what you played, green arrow = what Stockfish wanted
-- Every flagged move gets a plain-English reason, derived from the engine's own refutation
-  rather than from any language model: which piece hangs, what recaptures, what gets forked,
-  what the forced mate is
+- **Move-by-move review.** Step through the game and every one of your moves gets a verdict
+  (best / excellent / good / inaccuracy / mistake / blunder / missed win). When there was
+  something better, the board draws your move in red and the engine's in green, and you get:
+  - a plain-English reason it failed, derived from the engine's own refutation rather than
+    from any language model: which piece hangs, what recaptures, what gets forked, what the
+    forced mate is
+  - **Watch the better line** - rewinds a ply and plays the engine's continuation out on the
+    board, so the improvement is something you see rather than notation you decode
+  - **Try it yourself** - hands you the position back and makes you find the move
+- Live positional commentary on whatever position is in front of you: pieces you are leaving
+  hanging, loose enemy pieces worth grabbing, an uncastled king past move 8, being squeezed
+  on mobility, and material imbalance with the plan that follows from it
+- A game report with your clean-move percentage, a tally of every move quality, and the two
+  or three turning points as buttons that jump straight to the position
 - Coach's notes across all analysed games: average centipawn loss, which phase of the game
   you err in most, how often your mistakes are punished immediately, and whether an opening
   really does go worse than your own baseline

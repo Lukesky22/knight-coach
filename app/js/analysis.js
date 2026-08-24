@@ -156,6 +156,148 @@ function pvToSan(fen, pv, maxMoves) {
   return parts.join(' ');
 }
 
+// ---------- per-move verdicts and positional commentary ----------
+
+/**
+ * A label for every move, not just the bad ones - stepping through a game
+ * should tell you when you found the right idea as well as when you missed it.
+ */
+export function classify(rec) {
+  const mateSwing = isMateScore(rec.before) || isMateScore(rec.after);
+  if (mateSwing && rec.drop >= THRESHOLD) {
+    const hadMate = isMateScore(rec.before) && (rec.before > 0 === (rec.mover === 'w'));
+    return hadMate ? 'missed-win' : 'blunder';
+  }
+  if (rec.drop >= 300) return 'blunder';
+  if (rec.drop >= 150) return 'mistake';
+  if (rec.drop >= THRESHOLD) return 'inaccuracy';
+  const playedBest = rec.bestUci && rec.bestUci.slice(0, 4) === `${rec.played.from}${rec.played.to}`;
+  if (playedBest) return 'best';
+  if (rec.drop <= 20) return 'excellent';
+  return 'good';
+}
+
+export const VERDICT_LABEL = {
+  best: 'Best move',
+  excellent: 'Excellent',
+  good: 'Good',
+  inaccuracy: 'Inaccuracy',
+  mistake: 'Mistake',
+  blunder: 'Blunder',
+  'missed-win': 'Missed win',
+};
+
+/**
+ * Pieces of `color` that the opponent can profitably take right now: either the
+ * square is undefended, or the capture wins material outright.
+ */
+export function hangingFor(fen, color) {
+  const parts = fen.split(' ');
+  const opponent = color === 'w' ? 'b' : 'w';
+  if (parts[1] !== opponent) {
+    parts[1] = opponent;
+    parts[3] = '-';
+  }
+  let probe;
+  try { probe = new Chess(parts.join(' ')); } catch { return []; }
+
+  const found = [];
+  for (const m of probe.moves({ verbose: true })) {
+    if (!m.captured) continue;
+    const gain = VALUE[m.captured] - VALUE[m.piece];
+    let hanging = false;
+    try {
+      const after = new Chess(probe.fen());
+      after.move({ from: m.from, to: m.to, promotion: 'q' });
+      const canRecapture = after.moves({ verbose: true }).some((r) => r.to === m.to);
+      hanging = !canRecapture ? VALUE[m.captured] >= 1 : gain > 0;
+    } catch { hanging = gain > 0; }
+    if (hanging && !found.some((f) => f.square === m.to)) {
+      found.push({ square: m.to, piece: NAME[m.captured], by: m.san, value: VALUE[m.captured] });
+    }
+  }
+  return found.sort((a, b) => b.value - a.value);
+}
+
+function castledOrKingSafe(fen, color) {
+  const board = fen.split(' ')[0].split('/');
+  const kingChar = color === 'w' ? 'K' : 'k';
+  for (let r = 0; r < 8; r++) {
+    let file = 0;
+    for (const ch of board[r]) {
+      if (/\d/.test(ch)) { file += parseInt(ch, 10); continue; }
+      if (ch === kingChar) {
+        const rank = 8 - r;
+        const homeRank = color === 'w' ? 1 : 8;
+        // still on the back rank in the middle three files = uncastled
+        return !(rank === homeRank && file >= 3 && file <= 5);
+      }
+      file++;
+    }
+  }
+  return true;
+}
+
+/**
+ * Plain observations about the position in front of you - the sort of thing a
+ * coach says out loud while you both look at the board.
+ */
+export function positionNotes(fen, color, fullmove) {
+  const notes = [];
+  let chess;
+  try { chess = new Chess(fen); } catch { return notes; }
+
+  const hanging = hangingFor(fen, color);
+  if (hanging.length) {
+    const h = hanging[0];
+    notes.push({
+      kind: 'warn',
+      text: `Your ${h.piece} on ${h.square} can be taken by ${h.by}. Deal with it before doing anything else.`,
+    });
+  }
+
+  const theirs = hangingFor(fen, color === 'w' ? 'b' : 'w');
+  if (theirs.length && theirs[0].value >= 3) {
+    notes.push({
+      kind: 'good',
+      text: `Their ${theirs[0].piece} on ${theirs[0].square} is loose - look for a way to win it.`,
+    });
+  }
+
+  if (fullmove >= 8 && !castledOrKingSafe(fen, color)) {
+    notes.push({ kind: 'warn', text: 'Your king is still uncastled in the middle. Castling is usually the most valuable move available.' });
+  }
+
+  // whose pieces are doing more work
+  const mine = new Chess(fen);
+  if (mine.turn() !== color) {
+    const p = fen.split(' ');
+    p[1] = color; p[3] = '-';
+    try { mine.load(p.join(' ')); } catch { /* keep original */ }
+  }
+  const myMoves = mine.moves().length;
+  const flip = fen.split(' ');
+  flip[1] = color === 'w' ? 'b' : 'w';
+  flip[3] = '-';
+  let theirMoves = null;
+  try { theirMoves = new Chess(flip.join(' ')).moves().length; } catch { /* ignore */ }
+  if (theirMoves && myMoves && theirMoves > myMoves * 1.6 && fullmove >= 8) {
+    notes.push({ kind: 'warn', text: `Their pieces have ${theirMoves} moves to your ${myMoves}. You are being squeezed - trade something off or open a line.` });
+  }
+
+  const mat = material(fen);
+  const diff = color === 'w' ? mat.w - mat.b : mat.b - mat.w;
+  if (Math.abs(diff) >= 2) {
+    notes.push({
+      kind: diff > 0 ? 'good' : 'warn',
+      text: diff > 0
+        ? `You are ${diff} points of material up. Trade pieces, keep it simple, and head for the endgame.`
+        : `You are ${-diff} points down. Avoid trades and look for complications.`,
+    });
+  }
+  return notes;
+}
+
 // ---------- explaining WHY a move was bad ----------
 
 const VALUE = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };

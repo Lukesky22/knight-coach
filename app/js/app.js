@@ -5,7 +5,7 @@ import { getProfile, syncGames, loadCachedGames } from './chesscom.js';
 import { Board } from './board.js';
 import {
   analyzeGame, parseGame, fmtEval, isMateScore, explainMistake, dropDescription,
-  getEngine, MATE_CP, THRESHOLD,
+  classify, positionNotes, VERDICT_LABEL, getEngine, MATE_CP, THRESHOLD,
 } from './analysis.js';
 import { buildQueue, gradeCard, getProgress, saveProgress, stats } from './trainer.js';
 import { loadBook, bookAt, bookExit, pickBookMove, habitReport, openingReport } from './openings.js';
@@ -419,6 +419,7 @@ function renderGame(uuid) {
       <button class="btn nav" id="nav-end">⏭</button>
     </div>
 
+    <div id="review"></div>
     <div id="graph-wrap"></div>
     <div class="card"><div class="movegrid" id="movegrid"></div></div>
     <div id="analyze-area"></div>
@@ -427,33 +428,158 @@ function renderGame(uuid) {
   const board = new Board($('#board'));
   board.setFlip(g.myColor === 'b');
 
-  const flaggedByIdx = new Map(); // position index BEFORE the move -> record
-  const rebuildFlagMap = () => {
-    flaggedByIdx.clear();
-    if (!analysis) return;
-    for (const r of analysis.records) {
-      if (r.severity && r.mover === g.myColor) flaggedByIdx.set(r.i - 1, r);
-    }
-  };
-  rebuildFlagMap();
-
   const fenAt = (i) => (i === 0 ? startFen : moves[i - 1].after);
+  const recAt = (i) => (analysis && i > 0 ? analysis.records[i - 1] : null);
+  let playingLine = false; // true while the better line is being demonstrated
 
   function goTo(newIdx) {
+    if (playingLine) return;
     idx = Math.max(0, Math.min(moves.length, newIdx));
-    const rec = flaggedByIdx.get(idx);
+    drawCurrent();
+    for (const el of document.querySelectorAll('.mv')) el.classList.remove('cur');
+    if (idx > 0) $(`.mv[data-i="${idx}"]`)?.classList.add('cur');
+    updateEvalUI();
+    renderReview();
+  }
+
+  // Board for the move you are standing on: the move played in red, and the
+  // move that was better in green whenever they differ.
+  function drawCurrent() {
+    const rec = recAt(idx);
     const arrows = [];
     if (rec) {
-      arrows.push({ from: rec.played.from, to: rec.played.to, kind: 'played' });
-      if (rec.bestUci) arrows.push({ from: rec.bestUci.slice(0, 2), to: rec.bestUci.slice(2, 4), kind: 'best' });
+      const bestSame = rec.bestUci
+        && rec.bestUci.slice(0, 4) === `${rec.played.from}${rec.played.to}`;
+      if (!bestSame && rec.bestUci && rec.drop >= 20) {
+        arrows.push({ from: rec.played.from, to: rec.played.to, kind: 'played' });
+        arrows.push({ from: rec.bestUci.slice(0, 2), to: rec.bestUci.slice(2, 4), kind: 'best' });
+      }
     }
     board.position(fenAt(idx), {
       lastMove: idx > 0 ? [moves[idx - 1].from, moves[idx - 1].to] : null,
       arrows,
     });
-    for (const el of document.querySelectorAll('.mv')) el.classList.remove('cur');
-    if (idx > 0) $(`.mv[data-i="${idx}"]`)?.classList.add('cur');
-    updateEvalUI();
+  }
+
+  // Rewind one ply and walk through what the engine wanted, so the improvement
+  // is something you watch happen rather than a line of notation.
+  async function playBetterLine() {
+    const rec = recAt(idx);
+    if (!rec || !rec.bestUci || playingLine) return;
+    playingLine = true;
+    const btn = $('#show-line');
+    if (btn) btn.disabled = true;
+
+    const line = new Chess(rec.fenBefore);
+    const uciLine = [rec.bestUci];
+    // rebuild the rest of the engine's line from the SAN we stored
+    const sanRest = rec.bestLine ? rec.bestLine.replace(/^\d+\.+\s*/, '').split(' ').filter((t) => !/^\d+\.+$/.test(t)) : [];
+
+    board.position(rec.fenBefore, { lastMove: null, arrows: [
+      { from: rec.bestUci.slice(0, 2), to: rec.bestUci.slice(2, 4), kind: 'best' },
+    ] });
+    await new Promise((r) => setTimeout(r, 700));
+
+    for (const san of sanRest) {
+      let mv;
+      try { mv = line.move(san); } catch { break; }
+      if (!mv) break;
+      board.position(line.fen(), { lastMove: [mv.from, mv.to], arrows: [] });
+      const panel = $('#line-status');
+      if (panel) panel.textContent = `Better line: ${line.history().join(' ')}`;
+      await new Promise((r) => setTimeout(r, 750));
+    }
+    await new Promise((r) => setTimeout(r, 600));
+    playingLine = false;
+    drawCurrent();
+    renderReview();
+  }
+
+  function renderReview() {
+    const panel = $('#review');
+    if (!panel) return;
+    if (!analysis) {
+      panel.innerHTML = `<div class="card sub">Analyze this game to get move-by-move coaching.</div>`;
+      return;
+    }
+    const rec = recAt(idx);
+    if (!rec) {
+      const notes = positionNotes(fenAt(idx), g.myColor, 1);
+      panel.innerHTML = `<div class="card">
+        <h2>Starting position</h2>
+        <p class="sub">Step forward with ▶ (or swipe the board). Every move you made gets a verdict, and when there was something better you will see it in green.</p>
+        ${notes.map((n) => `<div class="note ${n.kind}">${esc(n.text)}</div>`).join('')}
+      </div>`;
+      return;
+    }
+
+    const verdict = classify(rec);
+    const isMine = rec.mover === g.myColor;
+    const bad = ['inaccuracy', 'mistake', 'blunder', 'missed-win'].includes(verdict);
+    const notes = positionNotes(fenAt(idx), g.myColor, Math.ceil(idx / 2));
+    const nextRec = analysis.records[rec.i] || null;
+
+    panel.innerHTML = `
+      <div class="card review-card ${verdict}">
+        <div class="review-head">
+          <div>
+            <span class="verdict ${verdict}">${VERDICT_LABEL[verdict]}</span>
+            <b class="review-move">${esc(rec.label)} ${esc(rec.san)}</b>
+          </div>
+          <span class="sub">${isMine ? 'your move' : `${esc(g.oppName)}'s move`}</span>
+        </div>
+
+        ${bad && isMine ? `
+          <p class="why">${esc(explainMistake(rec, nextRec))}</p>
+          <div class="legend">
+            <span><i class="sw played"></i>what you played</span>
+            <span><i class="sw best"></i>what was better</span>
+          </div>
+          <div class="row">
+            <button class="btn small" id="show-line">▶ Watch the better line</button>
+            <button class="btn small" id="try-here">Try it yourself</button>
+          </div>
+          <div class="sub" id="line-status"></div>
+        ` : bad ? `
+          <p class="why">${esc(g.oppName)} slipped here — ${esc(explainMistake(rec, nextRec))}</p>
+        ` : verdict === 'best' ? `
+          <p class="why">You found the engine's first choice.</p>
+        ` : `
+          <p class="why">Fine. The evaluation barely moved${rec.bestLine ? `; the engine's line was ${esc(rec.bestLine)}` : ''}.</p>
+        `}
+
+        ${notes.length ? `<div class="notes-block">
+          <div class="sub">In this position:</div>
+          ${notes.map((n) => `<div class="note ${n.kind}">${esc(n.text)}</div>`).join('')}
+        </div>` : ''}
+      </div>`;
+
+    const showBtn = $('#show-line');
+    if (showBtn) showBtn.onclick = playBetterLine;
+    const tryBtn = $('#try-here');
+    if (tryBtn) tryBtn.onclick = () => tryHere(rec);
+  }
+
+  // Put the position back in front of you and make you find the move.
+  function tryHere(rec) {
+    const line = new Chess(rec.fenBefore);
+    board.position(rec.fenBefore, { lastMove: null, arrows: [] });
+    board.setInteractive(true, {
+      legalFrom: (sq) => line.moves({ square: sq, verbose: true }).map((m) => m.to),
+      onMove: ({ from, to }) => {
+        let mv;
+        try { mv = line.move({ from, to, promotion: 'q' }); } catch { return; }
+        if (!mv) return;
+        const right = rec.bestUci && rec.bestUci.slice(0, 4) === `${from}${to}`;
+        board.setInteractive(false);
+        board.position(line.fen(), { lastMove: [from, to], arrows: [] });
+        $('#line-status').innerHTML = right
+          ? `<b style="color:var(--green)">✓ ${esc(mv.san)} — that's the move.</b>`
+          : `<b style="color:var(--red)">✗ ${esc(mv.san)}</b> — the move was <b>${esc((rec.bestLine || '').replace(/^\d+\.+\s*/, '').split(' ')[0] || '?')}</b>.`;
+        setTimeout(() => { drawCurrent(); }, 1600);
+      },
+    });
+    $('#line-status').textContent = 'Your move — play it on the board.';
   }
 
   function updateEvalUI() {
@@ -482,8 +608,11 @@ function renderGame(uuid) {
       for (const j of [i, i + 1]) {
         if (j >= moves.length) break;
         const r = analysis && analysis.records[j];
-        const dot = r && r.severity && r.mover === g.myColor ? `<i class="mdot ${r.severity}"></i>` : '';
-        html += `<span class="mv" data-i="${j + 1}">${esc(moves[j].san)}${dot}</span>`;
+        const v = r ? classify(r) : null;
+        // only mark your own moves: the point is to review your play
+        const mark = r && r.mover === g.myColor && v && v !== 'good' && v !== 'excellent'
+          ? `<i class="mdot ${v}"></i>` : '';
+        html += `<span class="mv" data-i="${j + 1}">${esc(moves[j].san)}${mark}</span>`;
       }
     }
     grid.innerHTML = html || '<span class="sub">No moves were played.</span>';
@@ -574,34 +703,45 @@ function renderGame(uuid) {
   function renderCoach() {
     const coach = $('#coach');
     if (!analysis) { coach.innerHTML = ''; return; }
-    const flagged = analysis.records
-      .filter((r) => r.severity && r.mover === g.myColor)
-      .sort((a, b) => b.drop - a.drop);
-    const c = analysis.summary.counts;
+    const mine = analysis.records.filter((r) => r.mover === g.myColor);
+    const tally = { best: 0, excellent: 0, good: 0, inaccuracy: 0, mistake: 0, blunder: 0, 'missed-win': 0 };
+    for (const r of mine) tally[classify(r)]++;
+    const clean = mine.length
+      ? Math.round(((tally.best + tally.excellent + tally.good) / mine.length) * 100)
+      : 0;
+
+    const turning = analysis.records
+      .filter((r) => r.mover === g.myColor && r.severity && r.severity !== 'inaccuracy')
+      .sort((a, b) => b.drop - a.drop)
+      .slice(0, 3);
+
     coach.innerHTML = `
       <div class="card">
-        <h2>Coach review <span class="sub">depth ${analysis.depth}</span></h2>
-        <div class="chips">
-          <span class="chip blunder">${c.blunder} blunders</span>
-          <span class="chip mistake">${c.mistake} mistakes</span>
-          <span class="chip inaccuracy">${c.inaccuracy} inaccuracies</span>
-          <span class="chip">ACPL ${analysis.summary.acpl}</span>
+        <h2>Game report <span class="sub">depth ${analysis.depth}</span></h2>
+        <div class="score-row">
+          <div class="score"><b>${clean}%</b><span>clean moves</span></div>
+          <div class="score"><b>${analysis.summary.acpl}</b><span>avg centipawn loss</span></div>
         </div>
-        ${flagged.length ? flagged.map((r) => `
-          <div class="flagcard ${r.severity}" data-i="${r.i}">
-            <div class="flaghead">
+        <div class="tally">
+          ${[['best', 'best'], ['excellent', 'excellent'], ['good', 'good'],
+             ['inaccuracy', 'inaccuracies'], ['mistake', 'mistakes'],
+             ['blunder', 'blunders'], ['missed-win', 'missed wins']]
+            .filter(([k]) => tally[k])
+            .map(([k, label]) => `<span class="chip ${k}">${tally[k]} ${label}</span>`).join('')}
+        </div>
+        ${turning.length ? `
+          <div class="sub" style="margin-top:12px">Turning points — tap to review:</div>
+          ${turning.map((r) => `
+            <button class="turning ${r.severity}" data-i="${r.i}">
               <b>${esc(r.label)} ${esc(r.san)}</b>
-              <span class="sev ${r.severity}">${SEV_LABEL[r.severity]}</span>
-            </div>
-            <div class="sub">${dropDescription(r)} · eval ${fmtEval(r.before)} → ${fmtEval(r.after)} · ${r.phase}</div>
-            <div class="why">${esc(explainMistake(r, analysis.records[r.i] || null))}</div>
-          </div>`).join('')
-        : `<p class="sub">No moves lost ${THRESHOLD}+ centipawns. Clean game — nice.</p>`}
+              <span class="sub">${dropDescription(r)}</span>
+            </button>`).join('')}
+        ` : `<p class="sub" style="margin-top:10px">No serious mistakes in this game. Well played.</p>`}
       </div>`;
     coach.onclick = (e) => {
-      const card = e.target.closest('.flagcard');
-      if (!card) return;
-      goTo(parseInt(card.dataset.i, 10) - 1);
+      const b = e.target.closest('.turning');
+      if (!b) return;
+      goTo(parseInt(b.dataset.i, 10));
       $('#board').scrollIntoView({ behavior: 'smooth', block: 'center' });
     };
   }

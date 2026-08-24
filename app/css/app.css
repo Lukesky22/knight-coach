@@ -175,6 +175,62 @@ line.arrow-played, polygon.arrow-played { stroke: #c33; fill: #c33; }
 .mdot.blunder { background: var(--red); }
 .mdot.mistake { background: var(--orange); }
 .mdot.inaccuracy { background: var(--yellow); }
+.mdot.best { background: var(--green); }
+.mdot\.missed-win, .mdot.missed-win { background: #b06ce0; }
+
+/* ---------- move-by-move review ---------- */
+.review-card { border-left: 3px solid var(--sub); }
+.review-card.blunder { border-left-color: var(--red); }
+.review-card.mistake { border-left-color: var(--orange); }
+.review-card.inaccuracy { border-left-color: var(--yellow); }
+.review-card.missed-win { border-left-color: #b06ce0; }
+.review-card.best { border-left-color: var(--green); }
+
+.review-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.review-move { margin-left: 8px; }
+.verdict {
+  font-size: 0.7rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em;
+  padding: 3px 8px; border-radius: 20px; background: var(--card2); color: var(--sub);
+}
+.verdict.blunder { color: var(--red); }
+.verdict.mistake { color: var(--orange); }
+.verdict.inaccuracy { color: var(--yellow); }
+.verdict.missed-win { color: #b06ce0; }
+.verdict.best, .verdict.excellent { color: var(--green); }
+
+.legend { display: flex; gap: 14px; margin: 8px 0; font-size: 0.78rem; color: var(--sub); }
+.legend .sw { display: inline-block; width: 14px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
+.legend .sw.played { background: #c33; }
+.legend .sw.best { background: #2e9e3f; }
+
+.notes-block { margin-top: 10px; padding-top: 8px; border-top: 1px solid #232936; }
+.note {
+  font-size: 0.85rem; line-height: 1.45; margin-top: 6px;
+  padding: 7px 10px; border-radius: 8px; background: var(--card2);
+  border-left: 3px solid var(--sub);
+}
+.note.warn { border-left-color: var(--orange); }
+.note.good { border-left-color: var(--green); }
+#line-status { margin-top: 8px; min-height: 1.2em; }
+
+.score-row { display: flex; gap: 12px; margin-bottom: 10px; }
+.score { flex: 1; background: var(--card2); border-radius: 10px; padding: 10px; text-align: center; }
+.score b { display: block; font-size: 1.4rem; }
+.score span { color: var(--sub); font-size: 0.72rem; }
+.tally { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip.best, .chip.excellent { color: var(--green); }
+.chip.good { color: var(--sub); }
+.chip.missed-win { color: #b06ce0; }
+
+.turning {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 8px;
+  width: 100%; text-align: left; margin-top: 6px; cursor: pointer;
+  background: var(--card2); color: var(--text);
+  border: none; border-left: 3px solid var(--sub); border-radius: 8px; padding: 9px 11px;
+  font-size: 0.9rem; font-family: inherit;
+}
+.turning.blunder { border-left-color: var(--red); }
+.turning.mistake { border-left-color: var(--orange); }
 
 /* ---------- coach ---------- */
 .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
