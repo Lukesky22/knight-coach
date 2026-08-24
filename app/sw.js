@@ -1,8 +1,8 @@
-﻿// Cache-first service worker for the app shell so Knight Coach opens
+// Cache-first service worker for the app shell so Knight Coach opens
 // instantly (and offline) from the home screen. Chess.com API calls are
 // never cached here - game data lives in IndexedDB.
 
-const VERSION = 'kc-v8';
+const VERSION = 'kc-v9';
 
 const PRECACHE = [
   '.',
@@ -16,6 +16,7 @@ const PRECACHE = [
   'js/trainer.js',
   'js/openings.js',
   'js/explain.js',
+  'js/play.js',
   'vendor/openings.json',
   'vendor/chess.js',
   'manifest.webmanifest',

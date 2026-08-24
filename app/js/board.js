@@ -205,10 +205,10 @@ export class Board {
     this.overlay.appendChild(line);
 
     const head = document.createElementNS(ns, 'polygon');
-    const hw = 0.22; // head half-width
-    const hx = x2 - ux * 0.42, hy = y2 - uy * 0.42;
+    const hw = 0.13; // head half-width, kept slim so it never hides a piece
+    const hx = x2 - ux * 0.30, hy = y2 - uy * 0.30;
     const px = -uy, py = ux;
-    const tipX = x2 - ux * 0.08, tipY = y2 - uy * 0.08;
+    const tipX = x2 - ux * 0.06, tipY = y2 - uy * 0.06;
     head.setAttribute('points', [
       `${tipX},${tipY}`,
       `${hx + px * hw},${hy + py * hw}`,

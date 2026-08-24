@@ -347,8 +347,52 @@ function forkTargets(fenAfterRefutation, toSquare) {
  * @param next  the record for the opponent's reply (holds the refutation PV
  *              and the position immediately after `rec` was played)
  */
+/**
+ * What the engine's move actually achieves, in words. Naming the move alone
+ * ("best was Be6") teaches nothing - the point is the idea behind it.
+ */
+export function describeBestMove(rec) {
+  if (!rec.bestUci) return '';
+  let chess, mv;
+  try {
+    chess = new Chess(rec.fenBefore);
+    mv = chess.move({
+      from: rec.bestUci.slice(0, 2),
+      to: rec.bestUci.slice(2, 4),
+      promotion: rec.bestUci[4] || 'q',
+    });
+  } catch { return ''; }
+  if (!mv) return '';
+
+  const san = mv.san;
+  const wasHanging = hangingFor(rec.fenBefore, rec.mover);
+  const stillHanging = hangingFor(chess.fen(), rec.mover);
+  const rescued = wasHanging.find((h) => !stillHanging.some((s) => s.square === h.square));
+
+  let idea;
+  if (mv.san === 'O-O' || mv.san === 'O-O-O') {
+    idea = 'tucks your king away and connects the rooks';
+  } else if (mv.captured) {
+    idea = `takes the ${NAME[mv.captured]} on ${mv.to}`;
+  } else if (rescued) {
+    idea = rescued.square === mv.from
+      ? `moves your ${rescued.piece} out of danger`
+      : `defends your ${rescued.piece} on ${rescued.square}`;
+  } else if (san.includes('+')) {
+    idea = 'gives check, so you get a free move to sort the position out';
+  } else if (mv.piece === 'p' && ['d', 'e'].includes(mv.to[0])) {
+    idea = 'takes space in the centre and opens lines for your pieces';
+  } else if (['n', 'b'].includes(mv.piece) && /[18]/.test(mv.from[1])) {
+    idea = 'brings a new piece into the game';
+  } else {
+    idea = 'keeps everything defended and leaves no target';
+  }
+  return `**${san}** was the move: it ${idea}.`;
+}
+
 export function explainMistake(rec, next) {
-  const better = rec.bestLine ? ` Instead ${rec.bestLine.replace(/^\d+\.+\s*/, '')} holds.` : '';
+  const best = describeBestMove(rec);
+  const better = best ? ` ${best}` : '';
 
   if (isMateScore(rec.after)) {
     const moverIsWinning = rec.after > 0 === (rec.mover === 'w');

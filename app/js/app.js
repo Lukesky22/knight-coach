@@ -13,12 +13,16 @@ import {
   hasApiKey, getApiKey, setApiKey, clearApiKey,
   explainMove, cachedExplanation, getSpend, spendUsd,
 } from './explain.js';
+import { LEVELS, engineMove, releaseEngine, buildPgn, outcomeOf } from './play.js';
 import { Chess } from '../vendor/chess.js';
 
 const $ = (sel, el = document) => el.querySelector(sel);
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
   { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
 ));
+// Coaching text marks the key move with **asterisks**; escape first, then let
+// only that one pattern through as markup.
+const rich = (s) => esc(s).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
 
 const S = {
   user: localStorage.getItem('kc.user') || '',
@@ -28,6 +32,9 @@ const S = {
   bulk: null,          // AbortController while "analyze all" runs
   offline: false,
   progress: null,      // trainer spaced-repetition state
+  practice: [],        // games played in the app, kept alongside Chess.com ones
+  playLevel: 2,
+  playColor: 'w',
 };
 
 const SEV_LABEL = { blunder: 'Blunder', mistake: 'Mistake', inaccuracy: 'Inaccuracy' };
@@ -47,12 +54,15 @@ async function loadAccount() {
   view.innerHTML = `<div class="center-note">Loading your games…</div>`;
   for (const [uuid, a] of await idbGetAll('analyses')) S.analyses.set(uuid, a);
   S.progress = await getProgress();
+  S.practice = (await idbGet('kv', 'practiceGames')) || [];
   const before = S.games.length ? S.games.length : null;
   S.syncError = null;
   try {
     S.games = await syncGames(S.user, (i, n) => {
       view.innerHTML = `<div class="center-note">Fetching archives ${i}/${n}…</div>`;
     });
+    // practice games sit in the same list, newest first
+    S.games = [...S.practice, ...S.games].sort((a, b) => b.endTime - a.endTime);
     S.offline = false;
     S.lastSync = Date.now();
     S.newGames = before === null ? 0 : Math.max(0, S.games.length - before);
@@ -95,6 +105,7 @@ function route() {
   else if (location.hash === '#openings') renderOpenings();
   else if (location.hash === '#drill') renderDrill();
   else if (location.hash === '#settings') renderSettings();
+  else if (location.hash === '#play') renderPlay();
   else renderHome();
 }
 
@@ -324,7 +335,7 @@ function renderHome() {
           <a class="game res-${x.resultForMe}" href="#g/${encodeURIComponent(x.uuid)}">
             <span class="res">${x.resultForMe}</span>
             <span class="dot ${x.myColor === 'w' ? 'wdot' : 'bdot'}"></span>
-            <span class="opp">${esc(x.oppName)} <i>(${x.oppRating})</i></span>
+            <span class="opp">${esc(x.oppName)}${x.oppRating ? ` <i>(${x.oppRating})</i>` : ''}</span>
             <span class="meta">${esc(x.opening)}</span>
             <span class="when">${new Date(x.endTime * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}${badge}</span>
           </a>`;
@@ -418,7 +429,7 @@ function renderGame(uuid) {
     <header class="top">
       <a class="btn small" href="#">←</a>
       <div>
-        <h1>vs ${esc(g.oppName)} (${g.oppRating})</h1>
+        <h1>vs ${esc(g.oppName)}${g.oppRating ? ` (${g.oppRating})` : ''}</h1>
         <div class="sub">${resultText} · ${esc(g.myResultCode)} · ${esc(g.opening)}</div>
       </div>
       <a class="btn small" href="${esc(g.url)}" target="_blank" rel="noopener">↗</a>
@@ -569,16 +580,20 @@ function renderGame(uuid) {
     const panel = $('#review');
     if (!panel) return;
     if (!analysis) {
-      panel.innerHTML = `<div class="card sub">Analyze this game to get move-by-move coaching.</div>`;
+      panel.innerHTML = `
+        <div class="card">
+          <h2>Reviewing this game…</h2>
+          <p class="sub" id="auto-status">Stockfish is looking at every position. This takes a few seconds.</p>
+          <div class="progress"><div id="auto-bar"></div></div>
+        </div>`;
       return;
     }
     const rec = recAt(idx);
     if (!rec) {
-      const notes = positionNotes(fenAt(idx), g.myColor, 1);
       panel.innerHTML = `<div class="card">
         <h2>Starting position</h2>
-        <p class="sub">Step forward with ▶ (or swipe the board). Every move you made gets a verdict, and when there was something better you will see it in green.</p>
-        ${notes.map((n) => `<div class="note ${n.kind}">${esc(n.text)}</div>`).join('')}
+        <p class="sub">Step forward with ▶ or swipe the board. Every move you made gets a
+        verdict, and when there was something better you will see it in green.</p>
       </div>`;
       return;
     }
@@ -600,7 +615,7 @@ function renderGame(uuid) {
         </div>
 
         ${bad && isMine ? `
-          <p class="why">${esc(explainMistake(rec, nextRec))}</p>
+          <p class="why">${rich(explainMistake(rec, nextRec))}</p>
           <div class="legend">
             <span><i class="sw played"></i>what you played</span>
             <span><i class="sw best"></i>what was better</span>
@@ -613,7 +628,7 @@ function renderGame(uuid) {
           <div class="sub" id="line-status"></div>
           <div id="coach-text"></div>
         ` : bad ? `
-          <p class="why">${esc(g.oppName)} slipped here — ${esc(explainMistake(rec, nextRec))}</p>
+          <p class="why">${esc(g.oppName)} slipped here — ${rich(explainMistake(rec, nextRec))}</p>
         ` : verdict === 'best' ? `
           <p class="why">You found the engine's first choice.</p>
         ` : `
@@ -765,15 +780,19 @@ function renderGame(uuid) {
       area.innerHTML = `<div class="card sub">Variant game (${esc(g.rules)}) — analysis works on standard chess only.</div>`;
       return;
     }
+    if (!analysis) { area.innerHTML = ''; return; } // the review is running itself
+    // Only offered once a review exists: a deeper second look is a deliberate
+    // choice, not something to put in the way of reading the first one.
     area.innerHTML = `
       <div class="card">
         <div class="row">
-          <label class="sub">Depth
-            <select id="g-depth">${[10, 12, 14, 16, 18].map((d) =>
+          <span class="sub">Reviewed at depth ${analysis.depth}.</span>
+          <label class="sub">Deeper
+            <select id="g-depth">${[14, 16, 18, 20].map((d) =>
               `<option ${d === S.depth ? 'selected' : ''}>${d}</option>`).join('')}
             </select>
           </label>
-          <button id="g-analyze" class="btn primary">${analysis ? `Re-analyze (now d${analysis.depth})` : 'Analyze this game'}</button>
+          <button id="g-analyze" class="btn small">Re-run</button>
         </div>
         <div class="progress" id="g-bar-wrap" hidden><div id="g-bar"></div></div>
       </div>`;
@@ -781,34 +800,56 @@ function renderGame(uuid) {
       S.depth = parseInt(e.target.value, 10);
       localStorage.setItem('kc.depth', String(S.depth));
     };
-    $('#g-analyze').onclick = async () => {
-      const btn = $('#g-analyze');
+    $('#g-analyze').onclick = () => {
       if (ctrl) { ctrl.abort(); return; }
-      ctrl = new AbortController();
-      btn.textContent = 'Stop';
       $('#g-bar-wrap').hidden = false;
-      try {
-        const a = await analyzeGame({
-          pgn: g.pgn, myColor: g.myColor, depth: S.depth, signal: ctrl.signal,
-          onProgress: (p, n) => { $('#g-bar').style.width = `${(p / n) * 100}%`; },
-        });
-        await idbPut('analyses', g.uuid, a);
-        S.analyses.set(g.uuid, a);
-        analysis = a;
-        rebuildFlagMap();
-        renderGraph(); renderMoveGrid(); renderCoach(); renderAnalyzeArea();
-        goTo(idx);
-      } catch (err) {
-        if (!err.cancelled) {
-          console.error(err);
-          $('#g-bar-wrap').hidden = true;
-          btn.textContent = 'Analyze this game';
-        } else {
-          renderAnalyzeArea();
+      runReview(S.depth, (p, n) => {
+        const bar = $('#g-bar');
+        if (bar) bar.style.width = `${(p / n) * 100}%`;
+      });
+    };
+  }
+
+  /**
+   * Run the engine over this game and refresh everything that depends on it.
+   * Called automatically when a game has never been reviewed - waiting behind
+   * a button was the single worst thing about the old flow.
+   */
+  async function runReview(depth, onProgress) {
+    if (ctrl) return;
+    ctrl = new AbortController();
+    try {
+      const a = await analyzeGame({
+        pgn: g.pgn,
+        myColor: g.myColor,
+        depth,
+        signal: ctrl.signal,
+        onProgress: onProgress || ((p, n) => {
+          const bar = $('#auto-bar');
+          if (bar) bar.style.width = `${(p / n) * 100}%`;
+          const st = $('#auto-status');
+          if (st) st.textContent = `Looking at position ${p} of ${n}…`;
+        }),
+      });
+      await idbPut('analyses', g.uuid, a);
+      S.analyses.set(g.uuid, a);
+      analysis = a;
+      renderGraph(); renderMoveGrid(); renderCoach(); renderAnalyzeArea();
+      goTo(idx);
+    } catch (err) {
+      if (!err.cancelled) {
+        console.error(err);
+        const panel = $('#review');
+        if (panel) {
+          panel.innerHTML = `<div class="card"><div class="note warn">
+            The review could not finish (${esc(err.message)}).
+            <button class="btn small" id="retry-review">Try again</button></div></div>`;
+          const retry = $('#retry-review');
+          if (retry) retry.onclick = () => { ctrl = null; renderReview(); runReview(depth); };
         }
       }
-      ctrl = null;
-    };
+    }
+    ctrl = null;
   }
 
   function renderCoach() {
@@ -883,6 +924,169 @@ function renderGame(uuid) {
   renderAnalyzeArea();
   renderCoach();
   goTo(0);
+
+  // No analysis yet? Start one immediately rather than showing a button.
+  if (!analysis && g.rules === 'chess') runReview(S.depth);
+}
+
+// ---------------------------------------------------------------- live play
+
+async function renderPlay() {
+  const level = LEVELS[S.playLevel ?? 2];
+  const myColor = S.playColor || 'w';
+  const chess = new Chess();
+  const sans = [];
+  let lastFromTo = null;
+  let thinking = false;
+  let finished = null;
+
+  $('#view').innerHTML = `
+    <header class="top">
+      <a class="btn small" href="#">←</a>
+      <div><h1>Play</h1><div class="sub" id="p-sub">vs Stockfish · ${esc(level.name)}</div></div>
+      <button class="btn small" id="p-new">New</button>
+    </header>
+    <div id="p-setup" class="card">
+      <h2>Choose a level</h2>
+      <div class="drill-picks">
+        ${LEVELS.map((l) => `<button class="btn small level-pick ${l.id === level.id ? 'on' : ''}"
+          data-level="${l.id}">${esc(l.name)} <i class="sub">${esc(l.elo)}</i></button>`).join('')}
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn small colour-pick ${myColor === 'w' ? 'on' : ''}" data-colour="w">Play White</button>
+        <button class="btn small colour-pick ${myColor === 'b' ? 'on' : ''}" data-colour="b">Play Black</button>
+      </div>
+      <button class="btn primary block" id="p-start">Start game</button>
+    </div>
+    <div id="p-game" hidden>
+      <div class="board-wrap"><div id="board"></div></div>
+      <div class="card" id="p-status"></div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn small" id="p-undo">Take back</button>
+        <button class="btn small" id="p-resign">Resign</button>
+      </div>
+    </div>`;
+
+  for (const b of document.querySelectorAll('.level-pick')) {
+    b.onclick = () => { S.playLevel = +b.dataset.level; renderPlay(); };
+  }
+  for (const b of document.querySelectorAll('.colour-pick')) {
+    b.onclick = () => { S.playColor = b.dataset.colour; renderPlay(); };
+  }
+  $('#p-new').onclick = () => renderPlay();
+
+  let board = null;
+
+  $('#p-start').onclick = async () => {
+    $('#p-setup').hidden = true;
+    $('#p-game').hidden = false;
+    board = new Board($('#board'));
+    board.setFlip(myColor === 'b');
+    draw();
+    if (myColor === 'b') await engineTurn();
+  };
+
+  const legalFrom = (sq) =>
+    (chess.turn() === myColor && !thinking && !finished
+      ? chess.moves({ square: sq, verbose: true }).map((m) => m.to)
+      : []);
+
+  function draw(msg) {
+    board.position(chess.fen(), { lastMove: lastFromTo, arrows: [] });
+    board.setInteractive(!finished && chess.turn() === myColor && !thinking, { legalFrom, onMove: human });
+    const status = $('#p-status');
+    if (!status) return;
+    if (finished) {
+      status.innerHTML = `
+        <h2>${esc(finished.headline)}</h2>
+        <p class="sub">${esc(finished.detail)}</p>
+        <button class="btn primary block" id="p-review">Review this game</button>`;
+      $('#p-review').onclick = () => reviewPracticeGame(finished.result);
+      return;
+    }
+    status.innerHTML = `<b>${thinking ? 'Stockfish is thinking…' : (chess.turn() === myColor ? 'Your move' : '…')}</b>
+      ${chess.inCheck() ? '<span class="sev blunder"> — check</span>' : ''}
+      ${msg ? `<div class="sub">${esc(msg)}</div>` : ''}
+      <div class="sub" style="margin-top:6px">${esc(sans.join(' ')) || 'No moves yet.'}</div>`;
+  }
+
+  function finish(reason, result) {
+    const iWon = (result === '1-0' && myColor === 'w') || (result === '0-1' && myColor === 'b');
+    const drawn = result === '1/2-1/2';
+    finished = {
+      result,
+      headline: drawn ? 'Drawn.' : iWon ? 'You won.' : 'You lost.',
+      detail: `By ${reason}. ${sans.length} moves played.`,
+    };
+    releaseEngine();
+    draw();
+  }
+
+  async function human({ from, to }) {
+    if (finished || thinking || chess.turn() !== myColor) return;
+    let mv;
+    try { mv = chess.move({ from, to, promotion: 'q' }); } catch { return; }
+    if (!mv) return;
+    sans.push(mv.san);
+    lastFromTo = [mv.from, mv.to];
+    const o = outcomeOf(chess);
+    if (o.over) { finish(o.reason, o.result); return; }
+    draw();
+    await engineTurn();
+  }
+
+  async function engineTurn() {
+    thinking = true;
+    draw();
+    try {
+      const uci = await engineMove(chess.fen(), level);
+      if (!uci) throw new Error('no move');
+      const mv = chess.move({ from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] || 'q' });
+      sans.push(mv.san);
+      lastFromTo = [mv.from, mv.to];
+    } catch {
+      thinking = false;
+      draw('The engine stumbled — take back a move and try again.');
+      return;
+    }
+    thinking = false;
+    const o = outcomeOf(chess);
+    if (o.over) { finish(o.reason, o.result); return; }
+    draw();
+  }
+
+  $('#p-undo').onclick = () => {
+    if (thinking || finished) return;
+    // undo the pair, so it is your move again
+    if (chess.history().length >= 2) { chess.undo(); chess.undo(); sans.splice(-2); }
+    else if (chess.history().length === 1) { chess.undo(); sans.pop(); }
+    const h = chess.history({ verbose: true });
+    lastFromTo = h.length ? [h[h.length - 1].from, h[h.length - 1].to] : null;
+    draw();
+  };
+  $('#p-resign').onclick = () => {
+    if (finished) return;
+    finish('resignation', myColor === 'w' ? '0-1' : '1-0');
+  };
+
+  async function reviewPracticeGame(result) {
+    const pgn = buildPgn({ sans, myColor, level, result });
+    const uuid = `practice-${Date.now()}`;
+    const game = {
+      uuid, url: '', pgn, endTime: Math.floor(Date.now() / 1000),
+      timeClass: 'practice', rated: false, rules: 'chess',
+      myColor, myRating: 0, myResultCode: 'practice',
+      oppName: `Stockfish (${level.name})`, oppRating: 0,
+      resultForMe: result === '1/2-1/2' ? 'D'
+        : ((result === '1-0') === (myColor === 'w') ? 'W' : 'L'),
+      opening: 'Practice game',
+      practice: true,
+    };
+    S.games.unshift(game);
+    S.practice.push(game);
+    await idbPut('kv', 'practiceGames', S.practice);
+    location.hash = `#g/${encodeURIComponent(uuid)}`;
+  }
 }
 
 // ---------------------------------------------------------------- settings
@@ -1299,7 +1503,7 @@ async function renderTrain() {
         <h2>${correct ? '✓ ' : '✗ '}${esc(verdict)}</h2>
         ${correct ? '' : `<p>The move was <b>${esc(bestSan)}</b>.</p>`}
         <p class="sub" style="margin-top:8px">In the game you played <b>${esc(r.san)}</b>:</p>
-        <p class="why">${esc(explainMistake(r, puzzle.next))}</p>
+        <p class="why">${rich(explainMistake(r, puzzle.next))}</p>
         <div class="row">
           <button class="btn primary" id="t-next">${pos + 1 < queue.length ? 'Next position' : 'Finish'}</button>
           <a class="btn small" href="#g/${encodeURIComponent(puzzle.gameUuid)}">See the game</a>
