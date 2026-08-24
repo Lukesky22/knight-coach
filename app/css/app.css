@@ -279,6 +279,11 @@ polygon.arrow-played { fill: #c33; }
   font-size: 0.92rem; line-height: 1.55;
 }
 .coach-meta { margin-top: 5px; font-size: 0.72rem; }
+.upsell {
+  margin-top: 10px; padding: 9px 11px; border-radius: 9px;
+  background: var(--card2); border-left: 3px solid var(--accent);
+  font-size: 0.82rem; line-height: 1.5; color: var(--sub);
+}
 
 .setup input, #key-in {
   display: block; width: 100%; margin: 12px 0;

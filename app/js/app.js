@@ -442,6 +442,7 @@ function renderGame(uuid) {
       <div id="board"></div>
     </div>
     <div id="strip-bottom" class="player-strip"></div>
+    <div id="turn-hint" class="note warn" hidden></div>
 
     <div class="controls">
       <button class="btn nav" id="nav-start">⏮</button>
@@ -560,8 +561,30 @@ function renderGame(uuid) {
 
   const exploreLegal = (sq) => {
     const c = explore ? explore.chess : new Chess(fenAt(idx));
-    return c.moves({ square: sq, verbose: true }).map((m) => m.to);
+    const dests = c.moves({ square: sq, verbose: true }).map((m) => m.to);
+    if (!dests.length) {
+      // Tapping a piece that cannot move is the single most confusing moment on
+      // an analysis board, so say why instead of doing nothing.
+      const piece = c.get(sq);
+      if (piece && piece.color !== c.turn()) {
+        const side = c.turn() === 'w' ? 'White' : 'Black';
+        const hint = `It is ${side} to move in this position. Use “Play it differently” to go back a move and play your own.`;
+        if (explore) { explore.hint = hint; renderReview(); }
+        else { showTurnHint(hint); }
+      }
+    }
+    return dests;
   };
+
+  function showTurnHint(text) {
+    const el = $('#turn-hint');
+    if (el) {
+      el.textContent = text;
+      el.hidden = false;
+      clearTimeout(showTurnHint.t);
+      showTurnHint.t = setTimeout(() => { el.hidden = true; }, 4000);
+    }
+  }
 
   // Every position shows the best move in green, and the board always accepts
   // a move so you can try your own ideas from anywhere in the game.
@@ -593,23 +616,80 @@ function renderGame(uuid) {
     renderStrips();
   }
 
-  function startExplore({ from, to }) {
-    const c = new Chess(fenAt(idx));
-    let mv;
-    try { mv = c.move({ from, to, promotion: 'q' }); } catch { return; }
-    if (!mv) return;
-    explore = { chess: c, from: idx, sans: [mv.san], bestReply: null, evalCp: null };
+  // Start a side line from `startIdx`. Landing on one of your own moves rewinds
+  // a ply first, because "let me try that again" means playing your move over,
+  // and after it has been played the board is showing your opponent's turn.
+  function beginExplore(startIdx) {
+    explore = {
+      chess: new Chess(fenAt(startIdx)),
+      from: startIdx,
+      sans: [],
+      bestReply: null,
+      evalCp: null,
+      thinking: false,
+      hint: '',
+    };
     drawExplore();
     renderReview();
-    scoreExplore();
   }
 
-  function playInExplore({ from, to }) {
+  function startExplore({ from, to }) {
+    if (!explore) beginExplore(idx);
+    playInExplore({ from, to });
+  }
+
+  async function playInExplore({ from, to }) {
+    if (explore.thinking) return;
     let mv;
     try { mv = explore.chess.move({ from, to, promotion: 'q' }); } catch { return; }
     if (!mv) return;
     explore.sans.push(mv.san);
     explore.bestReply = null;
+    explore.hint = '';
+    drawExplore();
+    renderReview();
+    await engineReply();
+    scoreExplore();
+  }
+
+  // The other side answers, so a side line plays like a real game rather than
+  // stopping dead after one move.
+  async function engineReply() {
+    if (ctrl || explore.autoReplyOff) return;
+    const over = explore.chess.isGameOver();
+    if (over) return;
+    const mine = explore;
+    mine.thinking = true;
+    drawExplore();
+    renderReview();
+    try {
+      const eng = await getEngine();
+      const info = await eng.evalPosition(mine.chess.fen(), 12);
+      if (explore !== mine) return;
+      const uci = info.pv && info.pv.length ? info.pv[0] : null;
+      if (uci) {
+        const mv = mine.chess.move({
+          from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] || 'q',
+        });
+        if (mv) mine.sans.push(mv.san);
+      }
+    } catch { /* leave the line where it is */ }
+    mine.thinking = false;
+    drawExplore();
+    renderReview();
+  }
+
+  function takeBackExplore() {
+    if (!explore || explore.thinking) return;
+    // undo the pair, so it is your turn again
+    if (explore.chess.history().length >= 2) {
+      explore.chess.undo(); explore.chess.undo(); explore.sans.splice(-2);
+    } else if (explore.chess.history().length === 1) {
+      explore.chess.undo(); explore.sans.pop();
+    }
+    if (!explore.sans.length) { leaveExplore(); return; }
+    explore.bestReply = null;
+    explore.evalCp = null;
     drawExplore();
     renderReview();
     scoreExplore();
@@ -692,31 +772,37 @@ function renderGame(uuid) {
       const baseEval = analysis.evals[explore.from];
       const lost = explore.evalCp === null ? null
         : (g.myColor === 'w' ? baseEval - explore.evalCp : explore.evalCp - baseEval);
+      const over = explore.chess.isGameOver();
       panel.innerHTML = `
         <div class="card review-card ${lost !== null && lost >= THRESHOLD ? 'mistake' : 'best'}">
           <div class="review-head">
-            <div><span class="verdict">Your line</span>
-              <b class="review-move">${esc(explore.sans.join(' '))}</b></div>
-            <span class="sub">trying it out</span>
+            <div><span class="verdict">Your line</span></div>
+            <span class="sub">${explore.thinking ? 'engine replying…' : 'playing it out'}</span>
           </div>
-          ${explore.evalCp === null
-            ? `<p class="sub">Working out how good that is…</p>`
+          <p class="review-move">${esc(explore.sans.join(' ')) || 'Your move — play anything.'}</p>
+          ${explore.evalCp === null || explore.thinking
+            ? `<p class="sub">${explore.thinking ? 'The engine is choosing its answer…' : 'Working out how good that is…'}</p>`
             : `<p class="why">Position is now <b>${esc(fmtEval(explore.evalCp))}</b>${
                 lost !== null
                   ? lost >= THRESHOLD
-                    ? ` — that costs you about ${(lost / 100).toFixed(1)} pawns compared with the game position.`
+                    ? ` — about ${(lost / 100).toFixed(1)} pawns worse for you than the game position.`
                     : lost <= -50
-                      ? ` — that is actually better for you than the game by ${(-lost / 100).toFixed(1)} pawns.`
-                      : ' — about the same as the game position.'
+                      ? ` — ${(-lost / 100).toFixed(1)} pawns better for you than what happened in the game.`
+                      : ' — much the same as the game position.'
                   : ''
               }</p>`}
-          ${explore.bestReply ? `<p class="sub">Green shows the reply the engine would make.</p>` : ''}
+          ${over ? `<p class="why">That ends the game right there.</p>` : ''}
+          ${explore.hint ? `<div class="note warn">${esc(explore.hint)}</div>` : ''}
+          <p class="sub">Keep playing moves — the engine answers each one. Green is its choice.</p>
           <div class="row">
+            <button class="btn small" id="ex-undo" ${explore.sans.length ? '' : 'disabled'}>Take back</button>
             <button class="btn small" id="ex-back">← Back to the game</button>
           </div>
         </div>`;
       const back = $('#ex-back');
       if (back) back.onclick = leaveExplore;
+      const undo = $('#ex-undo');
+      if (undo) undo.onclick = takeBackExplore;
       return;
     }
 
@@ -755,11 +841,14 @@ function renderGame(uuid) {
           </div>
           <div class="row">
             <button class="btn small" id="show-line">▶ Watch the better line</button>
-            <button class="btn small" id="try-here">Try it yourself</button>
+            <button class="btn small primary" id="try-here">Play it differently</button>
             ${hasApiKey() ? `<button class="btn small" id="ask-coach">Ask the coach</button>` : ''}
           </div>
           <div class="sub" id="line-status"></div>
           <div id="coach-text"></div>
+          ${hasApiKey() ? '' : `<div class="upsell">Want this explained properly — the plan,
+            not just the tactic? <a href="#settings">Add a Claude key</a> and every mistake
+            gets a written coaching note. About 2¢ a game.</div>`}
         ` : !isMine ? `
           <p class="sub">${bad
             ? `${esc(g.oppName)} slipped here, which is why the evaluation moved your way.`
@@ -778,8 +867,9 @@ function renderGame(uuid) {
 
     const showBtn = $('#show-line');
     if (showBtn) showBtn.onclick = playBetterLine;
+    // rewind one ply so the position is the one you actually had to solve
     const tryBtn = $('#try-here');
-    if (tryBtn) tryBtn.onclick = () => tryHere(rec);
+    if (tryBtn) tryBtn.onclick = () => beginExplore(idx - 1);
     const askBtn = $('#ask-coach');
     if (askBtn) {
       askBtn.onclick = () => askCoach(rec, nextRec, askBtn);
@@ -822,27 +912,6 @@ function renderGame(uuid) {
   }
 
   // Put the position back in front of you and make you find the move.
-  function tryHere(rec) {
-    const line = new Chess(rec.fenBefore);
-    board.position(rec.fenBefore, { lastMove: null, arrows: [] });
-    board.setInteractive(true, {
-      legalFrom: (sq) => line.moves({ square: sq, verbose: true }).map((m) => m.to),
-      onMove: ({ from, to }) => {
-        let mv;
-        try { mv = line.move({ from, to, promotion: 'q' }); } catch { return; }
-        if (!mv) return;
-        const right = rec.bestUci && rec.bestUci.slice(0, 4) === `${from}${to}`;
-        board.setInteractive(false);
-        board.position(line.fen(), { lastMove: [from, to], arrows: [] });
-        $('#line-status').innerHTML = right
-          ? `<b style="color:var(--green)">✓ ${esc(mv.san)} — that's the move.</b>`
-          : `<b style="color:var(--red)">✗ ${esc(mv.san)}</b> — the move was <b>${esc((rec.bestLine || '').replace(/^\d+\.+\s*/, '').split(' ')[0] || '?')}</b>.`;
-        setTimeout(() => { drawCurrent(); }, 1600);
-      },
-    });
-    $('#line-status').textContent = 'Your move — play it on the board.';
-  }
-
   function updateEvalUI() {
     const read = $('#eval-read');
     const fill = $('#evalfill');

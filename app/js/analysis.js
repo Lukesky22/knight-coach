@@ -390,9 +390,34 @@ export function describeBestMove(rec) {
   return `**${san}** was the move: it ${idea}.`;
 }
 
+/**
+ * The sentence a coach says first: were you already in trouble before you
+ * moved, and did the move address it? Missing an existing threat is a
+ * different mistake from creating a new weakness, and they need different
+ * fixes, so it is worth naming which one happened.
+ */
+function threatContext(rec) {
+  const beforeMine = hangingFor(rec.fenBefore, rec.mover);
+  if (!beforeMine.length) return '';
+  const worst = beforeMine[0];
+  // did the move rescue it?
+  let after = null;
+  try {
+    const c = new Chess(rec.fenBefore);
+    c.move({ from: rec.played.from, to: rec.played.to, promotion: 'q' });
+    after = hangingFor(c.fen(), rec.mover);
+  } catch { return ''; }
+  const stillLoose = after && after.some((h) => h.piece === worst.piece);
+  if (!stillLoose) return '';
+  const moved = rec.played.from === worst.square;
+  if (moved) return '';
+  return `Your ${worst.piece} on ${worst.square} was already hanging before this, and ${rec.san} neither moves it nor defends it. `;
+}
+
 export function explainMistake(rec, next) {
   const best = describeBestMove(rec);
   const better = best ? ` ${best}` : '';
+  const context = threatContext(rec);
 
   if (isMateScore(rec.after)) {
     const moverIsWinning = rec.after > 0 === (rec.mover === 'w');
@@ -437,7 +462,10 @@ export function explainMistake(rec, next) {
     const recaptures = chess.moves({ verbose: true }).filter((m) => m.to === refMove.to);
 
     if (!recaptures.length) {
-      return `This hangs your ${piece} on ${refMove.to}: ${refMove.san} simply takes it and nothing can recapture.${better}`;
+      const worth = VALUE[refMove.captured] >= 3
+        ? ' — a whole piece for nothing'
+        : VALUE[refMove.captured] >= 5 ? ' — a rook for nothing' : ' for free';
+      return `${context}${refMove.san} simply takes your ${piece} on ${refMove.to} and nothing can recapture${worth}.${better}`;
     }
     // You can take back, so weigh the whole trade, not just their capture.
     // Recapturing with the cheapest piece is the normal choice.
@@ -447,7 +475,7 @@ export function explainMistake(rec, next) {
     const net = myMatBefore - (mine === 'w' ? after.w : after.b);
 
     if (net >= 2) {
-      return `${refMove.san} wins your ${piece} on ${refMove.to}. Taking back with the ${NAME[cheapest.piece]} still leaves you about ${net} points of material down.${better}`;
+      return `${context}${refMove.san} wins your ${piece} on ${refMove.to}. Even after you take back with the ${NAME[cheapest.piece]} you are about ${net} points of material down, which at this level usually decides the game on its own.${better}`;
     }
     if (capForks.length >= 2) {
       return `${refMove.san} takes the ${piece} and forks your ${NAME[capForks[0]]} and ${NAME[capForks[1]]}, so another piece drops next move.${better}`;
@@ -460,9 +488,19 @@ export function explainMistake(rec, next) {
     return `${refMove.san} hits your ${NAME[forks[0]]} and ${NAME[forks[1]]} at once — you cannot save both.${better}`;
   }
   if (refMove.san.includes('+')) {
-    return `${refMove.san} is check, and dealing with it costs you ${(rec.drop / 100).toFixed(1)} pawns.${better}`;
+    return `${context}${refMove.san} comes with check, so you have to answer it before doing anything you wanted to do, and that costs about ${(rec.drop / 100).toFixed(1)} pawns.${better}`;
   }
-  return `The quiet reply ${refMove.san} leaves you ${(rec.drop / 100).toFixed(1)} pawns worse, with no good way to untangle.${better}`;
+  // A quiet refutation means the damage is positional: name what the opponent
+  // is now threatening rather than leaving it at "you are worse".
+  let threat = '';
+  try {
+    const afterRef = new Chess(chess.fen());
+    const loose = hangingFor(afterRef.fen(), rec.mover);
+    if (loose.length) {
+      threat = ` It threatens ${loose[0].by}, winning your ${loose[0].piece} on ${loose[0].square}.`;
+    }
+  } catch { /* no extra detail */ }
+  return `${context}${refMove.san} is quiet but strong: it leaves you about ${(rec.drop / 100).toFixed(1)} pawns worse with no clean way to untangle.${threat}${better}`;
 }
 
 export function parseGame(pgn) {
