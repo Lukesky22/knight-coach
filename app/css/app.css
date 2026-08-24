@@ -259,6 +259,20 @@ line.arrow-played, polygon.arrow-played { stroke: #c33; fill: #c33; }
 .note.good { border-left-color: var(--green); }
 #line-status { margin-top: 8px; min-height: 1.2em; }
 
+.coach-said {
+  margin-top: 10px; padding: 11px 13px; border-radius: 10px;
+  background: linear-gradient(180deg, rgba(122,184,255,0.10), rgba(122,184,255,0.04));
+  border-left: 3px solid var(--accent);
+  font-size: 0.92rem; line-height: 1.55;
+}
+.coach-meta { margin-top: 5px; font-size: 0.72rem; }
+
+.setup input, #key-in {
+  display: block; width: 100%; margin: 12px 0;
+  background: var(--card2); border: 1px solid #2a3140; border-radius: 10px;
+  color: var(--text); padding: 13px 14px; font-size: 1rem; font-family: inherit;
+}
+
 .score-row { display: flex; gap: 12px; margin-bottom: 10px; }
 .score { flex: 1; background: var(--card2); border-radius: 10px; padding: 10px; text-align: center; }
 .score b { display: block; font-size: 1.4rem; }

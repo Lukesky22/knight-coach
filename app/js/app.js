@@ -9,6 +9,10 @@ import {
 } from './analysis.js';
 import { buildQueue, gradeCard, getProgress, saveProgress, stats } from './trainer.js';
 import { loadBook, bookAt, bookExit, pickBookMove, habitReport, openingReport } from './openings.js';
+import {
+  hasApiKey, getApiKey, setApiKey, clearApiKey,
+  explainMove, cachedExplanation, getSpend, spendUsd,
+} from './explain.js';
 import { Chess } from '../vendor/chess.js';
 
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -90,6 +94,7 @@ function route() {
   else if (location.hash === '#train') renderTrain();
   else if (location.hash === '#openings') renderOpenings();
   else if (location.hash === '#drill') renderDrill();
+  else if (location.hash === '#settings') renderSettings();
   else renderHome();
 }
 
@@ -328,7 +333,7 @@ function renderHome() {
     </div>
 
     <div class="foot">
-      <a href="#" id="switch">Switch account</a>
+      <a href="#settings">Settings</a> · <a href="#" id="switch">Switch account</a>
     </div>`;
 
   $('#sync').onclick = async () => {
@@ -603,8 +608,10 @@ function renderGame(uuid) {
           <div class="row">
             <button class="btn small" id="show-line">▶ Watch the better line</button>
             <button class="btn small" id="try-here">Try it yourself</button>
+            ${hasApiKey() ? `<button class="btn small" id="ask-coach">Ask the coach</button>` : ''}
           </div>
           <div class="sub" id="line-status"></div>
+          <div id="coach-text"></div>
         ` : bad ? `
           <p class="why">${esc(g.oppName)} slipped here — ${esc(explainMistake(rec, nextRec))}</p>
         ` : verdict === 'best' ? `
@@ -623,6 +630,45 @@ function renderGame(uuid) {
     if (showBtn) showBtn.onclick = playBetterLine;
     const tryBtn = $('#try-here');
     if (tryBtn) tryBtn.onclick = () => tryHere(rec);
+    const askBtn = $('#ask-coach');
+    if (askBtn) {
+      askBtn.onclick = () => askCoach(rec, nextRec, askBtn);
+      // if this move was explained before, show it straight away and for free
+      cachedExplanation(rec).then((text) => {
+        if (text && $('#coach-text')) {
+          $('#coach-text').innerHTML = `<div class="coach-said">${esc(text)}</div>`;
+          askBtn.remove();
+        }
+      });
+    }
+  }
+
+  async function askCoach(rec, nextRec, btn) {
+    const out = $('#coach-text');
+    if (!out) return;
+    btn.disabled = true;
+    btn.textContent = 'Asking…';
+    out.innerHTML = `<div class="sub">Claude is looking at the position…</div>`;
+    try {
+      const { text, cached, spend } = await explainMove({
+        rec,
+        mechanical: explainMistake(rec, nextRec),
+        opening: g.opening,
+        myColor: g.myColor,
+        oppName: g.oppName,
+      });
+      out.innerHTML = `
+        <div class="coach-said">${esc(text)}</div>
+        <div class="sub coach-meta">${cached
+          ? 'From cache, no charge.'
+          : `Claude Sonnet 5 · $${spendUsd(spend).toFixed(3)} spent in total`}</div>`;
+      btn.remove();
+    } catch (err) {
+      out.innerHTML = `<div class="note warn">${esc(err.message)}
+        ${/key/i.test(err.message) ? ' <a href="#settings">Open settings</a>' : ''}</div>`;
+      btn.disabled = false;
+      btn.textContent = 'Ask the coach';
+    }
   }
 
   // Put the position back in front of you and make you find the move.
@@ -837,6 +883,72 @@ function renderGame(uuid) {
   renderAnalyzeArea();
   renderCoach();
   goTo(0);
+}
+
+// ---------------------------------------------------------------- settings
+
+async function renderSettings() {
+  const spend = await getSpend();
+  const usd = spendUsd(spend);
+  const saved = hasApiKey();
+  const masked = saved ? `${getApiKey().slice(0, 11)}…${getApiKey().slice(-4)}` : '';
+
+  $('#view').innerHTML = `
+    <header class="top">
+      <a class="btn small" href="#">←</a>
+      <div><h1>Settings</h1></div>
+      <span></span>
+    </header>
+
+    <div class="card">
+      <h2>Written coaching from Claude</h2>
+      <p class="sub">Everything else in this app is free and runs on your phone. This one
+      feature calls Anthropic's API, which costs a small amount per explanation. It only
+      ever runs when you press a button, and each explanation is saved forever, so you
+      never pay twice for the same move.</p>
+
+      ${saved ? `
+        <div class="note good">Key saved on this device: <b>${esc(masked)}</b></div>
+        <div class="score-row" style="margin-top:12px">
+          <div class="score"><b>$${usd.toFixed(3)}</b><span>spent so far</span></div>
+          <div class="score"><b>${spend.calls}</b><span>explanations</span></div>
+        </div>
+        <button class="btn" id="key-clear" style="margin-top:10px">Remove key from this device</button>
+      ` : `
+        <input id="key-in" type="password" placeholder="sk-ant-..." autocapitalize="none"
+               autocorrect="off" spellcheck="false" />
+        <button class="btn primary block" id="key-save">Save key on this device</button>
+      `}
+      <div id="key-msg" class="err"></div>
+    </div>
+
+    <div class="card">
+      <h2>Before you paste a key</h2>
+      <div class="note warn">Make a <b>separate</b> key for this app in the Anthropic Console
+      and put a monthly spend limit on its workspace. Then the worst case is capped and you
+      can revoke it in one click. Do not reuse a key you use for anything else.</div>
+      <div class="note">The key is stored only in this browser's storage on this device. It
+      is not in the app's public source code, and nobody else visiting the site has it. But
+      anyone with access to this unlocked phone could read it, so treat it like a password.</div>
+      <p class="sub">Model: Claude Sonnet 5. Roughly $0.02 per game, about $1.50 to explain
+      every game you have ever played.</p>
+    </div>`;
+
+  const msg = $('#key-msg');
+  if (saved) {
+    $('#key-clear').onclick = () => { clearApiKey(); renderSettings(); };
+  } else {
+    $('#key-save').onclick = () => {
+      const v = $('#key-in').value.trim();
+      if (!v) return;
+      if (!v.startsWith('sk-ant-')) {
+        msg.textContent = 'That does not look like an Anthropic key (they start with sk-ant-).';
+        return;
+      }
+      setApiKey(v);
+      renderSettings();
+    };
+  }
 }
 
 // ---------------------------------------------------------------- openings

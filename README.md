@@ -111,8 +111,27 @@ chess_review.py         the original desktop script this app grew out of
 ```
 
 `chess_review.py` still works on its own for a single PGN, and can add written
-explanations from Claude if `ANTHROPIC_API_KEY` is set. The app deliberately leaves that
-out, because it is the one part that is not free.
+explanations from Claude if `ANTHROPIC_API_KEY` is set.
+
+## Written coaching (the one paid feature)
+
+Optional, off unless you add a key under Settings. `js/explain.js` calls Claude Sonnet 5
+(`claude-sonnet-5`) directly from the browser to explain a flagged move in plain prose -
+what went wrong, and what the better move was trying to achieve.
+
+- It runs only when you press **Ask the coach** on a move. Nothing is called in the
+  background, and nothing is called while you browse.
+- Every explanation is cached in IndexedDB keyed by position plus move played, so
+  re-reading a game costs nothing.
+- Thinking is explicitly disabled: a few sentences does not need reasoning tokens, and
+  thinking is billed as output.
+- Settings shows a running total of what you have spent. Failed calls are not counted.
+- Roughly $0.02 a game at list price; about $1.50 to explain every game in this account.
+
+The key is kept in `localStorage` on the device that entered it. It is not in this
+repository and not in the published site, so other visitors do not have it. Anyone with
+access to the unlocked device could read it, so use a dedicated key with a spend limit on
+its workspace rather than one you use elsewhere.
 
 ## Tuning
 
