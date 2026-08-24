@@ -462,10 +462,12 @@ export function explainMistake(rec, next) {
     const recaptures = chess.moves({ verbose: true }).filter((m) => m.to === refMove.to);
 
     if (!recaptures.length) {
-      const worth = VALUE[refMove.captured] >= 3
-        ? ' — a whole piece for nothing'
-        : VALUE[refMove.captured] >= 5 ? ' — a rook for nothing' : ' for free';
-      return `${context}${refMove.san} simply takes your ${piece} on ${refMove.to} and nothing can recapture${worth}.${better}`;
+      const v = VALUE[refMove.captured];
+      const worth = v >= 9 ? 'the queen, for nothing'
+        : v >= 5 ? 'a whole rook, for nothing'
+        : v >= 3 ? 'a whole piece, for nothing'
+        : 'a free pawn';
+      return `${context}${refMove.san} simply takes your ${piece} on ${refMove.to} and nothing can recapture — ${worth}.${better}`;
     }
     // You can take back, so weigh the whole trade, not just their capture.
     // Recapturing with the cheapest piece is the normal choice.
