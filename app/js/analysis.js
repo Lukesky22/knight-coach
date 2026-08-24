@@ -13,12 +13,18 @@ const ENGINE_URL = 'vendor/sf/stockfish-18-lite-single.js';
 
 // ---------- engine worker ----------
 
-let engine = null;
+let enginePromise = null;
+
+const DEFAULT_SKILL = 20;      // full strength; Play mode passes its own
+const EVAL_TIMEOUT_MS = 120000; // a wedged worker must not hang the UI forever
 
 class Engine {
   constructor() {
     this.worker = new Worker(ENGINE_URL);
     this.lineHandler = null;
+    this.appliedSkill = null;
+    this.dead = false;
+    this.queue = Promise.resolve();
     this.worker.onmessage = (e) => {
       const line = typeof e.data === 'string' ? e.data : '';
       if (this.lineHandler) this.lineHandler(line);
@@ -26,38 +32,80 @@ class Engine {
   }
 
   send(cmd) {
-    this.worker.postMessage(cmd);
+    if (!this.dead) this.worker.postMessage(cmd);
   }
 
-  waitFor(pred) {
-    return new Promise((resolve) => {
+  /**
+   * The worker speaks one conversation at a time: a second `go` while the first
+   * is running would steal its handler and leave the first caller waiting for a
+   * `bestmove` that already went elsewhere. Every request is therefore queued
+   * and runs to completion before the next one starts.
+   */
+  enqueue(task) {
+    const run = this.queue.then(task, task);
+    this.queue = run.then(() => {}, () => {});
+    return run;
+  }
+
+  waitFor(pred, ms = EVAL_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.lineHandler = null;
+        reject(new Error('engine timed out'));
+      }, ms);
       this.lineHandler = (line) => {
         const hit = pred(line);
-        if (hit) { this.lineHandler = null; resolve(hit); }
+        if (hit) {
+          clearTimeout(timer);
+          this.lineHandler = null;
+          resolve(hit);
+        }
       };
     });
   }
 
-  async init() {
-    const ready = this.waitFor((l) => l === 'uciok');
-    this.send('uci');
-    await ready;
-    this.send('setoption name Threads value 1');
-    const ok = this.waitFor((l) => l === 'readyok');
-    this.send('isready');
-    await ok;
+  init() {
+    return this.enqueue(async () => {
+      const ready = this.waitFor((l) => l === 'uciok');
+      this.send('uci');
+      await ready;
+      this.send('setoption name Threads value 1');
+      const ok = this.waitFor((l) => l === 'readyok');
+      this.send('isready');
+      await ok;
+    });
   }
 
   // Returns {type: 'cp'|'mate', value, pv: [uci...]} from the side-to-move's view.
-  evalPosition(fen, depth) {
-    return new Promise((resolve) => {
+  // `skill` is per request: analysis always searches at full strength even if a
+  // practice game against a weak level is still open in another view.
+  evalPosition(fen, depth, opts = {}) {
+    const skill = opts.skill == null ? DEFAULT_SKILL : opts.skill;
+    return this.enqueue(() => this.runEval(fen, depth, skill));
+  }
+
+  runEval(fen, depth, skill) {
+    return new Promise((resolve, reject) => {
+      if (this.dead) {
+        reject(new Error('engine stopped'));
+        return;
+      }
+      if (this.appliedSkill !== skill) {
+        this.send(`setoption name Skill Level value ${skill}`);
+        this.appliedSkill = skill;
+      }
       let best = null;
+      const timer = setTimeout(() => {
+        this.lineHandler = null;
+        reject(new Error('engine timed out'));
+      }, EVAL_TIMEOUT_MS);
       this.lineHandler = (line) => {
         if (line.startsWith('info ') && line.includes(' pv ') && !/bound/.test(line)) {
-          const s = line.match(/ score (cp|mate) (-?\d+)/);
+          const sc = line.match(/ score (cp|mate) (-?\d+)/);
           const pv = line.match(/ pv (.+)$/);
-          if (s && pv) best = { type: s[1], value: parseInt(s[2], 10), pv: pv[1].split(' ') };
+          if (sc && pv) best = { type: sc[1], value: parseInt(sc[2], 10), pv: pv[1].split(' ') };
         } else if (line.startsWith('bestmove')) {
+          clearTimeout(timer);
           this.lineHandler = null;
           resolve(best || { type: 'cp', value: 0, pv: [] });
         }
@@ -68,21 +116,32 @@ class Engine {
   }
 
   destroy() {
+    this.dead = true;
+    this.lineHandler = null;
     this.worker.terminate();
   }
 }
 
-export async function getEngine() {
-  if (!engine) {
-    engine = new Engine();
-    await engine.init();
+// One shared worker. The promise is cached, not the instance, so two callers
+// racing at startup cannot each build their own engine.
+export function getEngine() {
+  if (!enginePromise) {
+    enginePromise = (async () => {
+      const e = new Engine();
+      await e.init();
+      return e;
+    })().catch((err) => {
+      enginePromise = null;
+      throw err;
+    });
   }
-  return engine;
+  return enginePromise;
 }
 
 export function resetEngine() {
-  if (engine) engine.destroy();
-  engine = null;
+  const pending = enginePromise;
+  enginePromise = null;
+  if (pending) pending.then((e) => e.destroy(), () => {});
 }
 
 // ---------- score plumbing (mirrors the Python) ----------
@@ -120,8 +179,36 @@ export function dropDescription(rec) {
   return `cost you ${(rec.drop / 100).toFixed(1)} pawns`;
 }
 
+/** Did the player actually play the move the engine wanted? */
+export function playedBestMove(rec) {
+  if (!rec.bestUci || !rec.played) return false;
+  return rec.bestUci.slice(0, 4) === `${rec.played.from}${rec.played.to}`;
+}
+
+/** Was there only one legal move? Nobody can be blamed for a forced reply. */
+export function onlyLegalMove(rec) {
+  if (!rec.fenBefore) return false;
+  try {
+    return new Chess(rec.fenBefore).moves().length === 1;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A move the engine itself recommended, or the only move on the board, is never
+ * the player's error - however far the evaluation fell. Without this, a forced
+ * king move into a lost position is reported as a blunder and then recommended
+ * as the improvement in the very next sentence.
+ */
+export function isExonerated(rec) {
+  if (rec.exonerated != null) return rec.exonerated;
+  return playedBestMove(rec) || onlyLegalMove(rec);
+}
+
 export function severity(rec) {
   if (rec.drop < THRESHOLD) return null;
+  if (isExonerated(rec)) return null;
   const mate = isMateScore(rec.before) || isMateScore(rec.after);
   if (mate || rec.drop >= 300) return 'blunder';
   if (rec.drop >= 150) return 'mistake';
@@ -163,6 +250,7 @@ function pvToSan(fen, pv, maxMoves) {
  * should tell you when you found the right idea as well as when you missed it.
  */
 export function classify(rec) {
+  if (isExonerated(rec)) return 'best';
   const mateSwing = isMateScore(rec.before) || isMateScore(rec.after);
   if (mateSwing && rec.drop >= THRESHOLD) {
     const hadMate = isMateScore(rec.before) && (rec.before > 0 === (rec.mover === 'w'));
@@ -171,8 +259,6 @@ export function classify(rec) {
   if (rec.drop >= 300) return 'blunder';
   if (rec.drop >= 150) return 'mistake';
   if (rec.drop >= THRESHOLD) return 'inaccuracy';
-  const playedBest = rec.bestUci && rec.bestUci.slice(0, 4) === `${rec.played.from}${rec.played.to}`;
-  if (playedBest) return 'best';
   if (rec.drop <= 20) return 'excellent';
   return 'good';
 }
@@ -451,36 +537,46 @@ export function explainMistake(rec, next) {
   if (!refMove) return `This drops ${(rec.drop / 100).toFixed(1)} pawns.${better}`;
 
   const mine = rec.mover === 'w' ? 'w' : 'b';
-  const before = material(next.fenBefore);
-  const myMatBefore = mine === 'w' ? before.w : before.b;
-
-  // Look for threats before mutating the position any further.
-  const capForks = refMove.captured ? forkTargets(chess.fen(), refMove.to) : [];
+  // Weigh the exchange from before your own move, and as a difference between
+  // both sides. Counting only the material you lost makes an even trade read as
+  // "3 points down", which fires on most captures.
+  const balance = (fen) => {
+    const m = material(fen);
+    return mine === 'w' ? m.w - m.b : m.b - m.w;
+  };
+  const balanceBefore = balance(rec.fenBefore);
 
   if (refMove.captured) {
     const piece = NAME[refMove.captured];
     const recaptures = chess.moves({ verbose: true }).filter((m) => m.to === refMove.to);
 
     if (!recaptures.length) {
-      const v = VALUE[refMove.captured];
-      const worth = v >= 9 ? 'the queen, for nothing'
-        : v >= 5 ? 'a whole rook, for nothing'
-        : v >= 3 ? 'a whole piece, for nothing'
-        : 'a free pawn';
-      return `${context}${refMove.san} simply takes your ${piece} on ${refMove.to} and nothing can recapture — ${worth}.${better}`;
+      const net = balanceBefore - balance(chess.fen());
+      // Their capturing piece is still standing here, so a fork claim is real.
+      const forks = forkTargets(chess.fen(), refMove.to);
+      // "for nothing" has to be earned: measure the whole exchange from before
+      // your own move. A capture you already paid for is a trade, not a gift.
+      if (net >= 1) {
+        const worth = net >= 9 ? 'the queen, for nothing'
+          : net >= 5 ? 'a whole rook, for nothing'
+          : net >= 3 ? 'a whole piece, for nothing'
+          : net >= 2 ? `${net} points of material`
+          : 'a free pawn';
+        return `${context}${refMove.san} simply takes your ${piece} on ${refMove.to} and nothing can recapture — ${worth}.${better}`;
+      }
+      if (forks.length >= 2) {
+        return `${context}${refMove.san} takes the ${piece} and forks your ${NAME[forks[0]]} and ${NAME[forks[1]]}, so another piece drops next move.${better}`;
+      }
+      return `${context}${refMove.san} takes on ${refMove.to}, and though the material comes out even you have nothing to take back with, leaving you ${(rec.drop / 100).toFixed(1)} pawns worse.${better}`;
     }
     // You can take back, so weigh the whole trade, not just their capture.
     // Recapturing with the cheapest piece is the normal choice.
     const cheapest = recaptures.sort((a, b) => VALUE[a.piece] - VALUE[b.piece])[0];
     chess.move({ from: cheapest.from, to: cheapest.to, promotion: 'q' });
-    const after = material(chess.fen());
-    const net = myMatBefore - (mine === 'w' ? after.w : after.b);
+    const net = balanceBefore - balance(chess.fen());
 
     if (net >= 2) {
       return `${context}${refMove.san} wins your ${piece} on ${refMove.to}. Even after you take back with the ${NAME[cheapest.piece]} you are about ${net} points of material down, which at this level usually decides the game on its own.${better}`;
-    }
-    if (capForks.length >= 2) {
-      return `${refMove.san} takes the ${piece} and forks your ${NAME[capForks[0]]} and ${NAME[capForks[1]]}, so another piece drops next move.${better}`;
     }
     return `${refMove.san} trades on ${refMove.to} with tempo and leaves you ${(rec.drop / 100).toFixed(1)} pawns worse.${better}`;
   }
@@ -575,6 +671,7 @@ export async function analyzeGame({ pgn, myColor, depth, onProgress, signal }) {
       bestLine: pvToSan(mv.before, prevPv, PV_MOVES),
       phase: phaseOf(mv.before, fullmove),
     };
+    rec.exonerated = playedBestMove(rec) || onlyLegalMove(rec);
     rec.severity = severity(rec);
     records.push(rec);
 
@@ -585,13 +682,13 @@ export async function analyzeGame({ pgn, myColor, depth, onProgress, signal }) {
   }
 
   const mine = myColor ? records.filter((r) => r.mover === myColor) : records;
-  const flagged = mine.filter((r) => r.drop >= THRESHOLD);
+  const flagged = mine.filter((r) => r.severity);
   flagged.sort((a, b) => b.drop - a.drop);
 
   const counts = { blunder: 0, mistake: 0, inaccuracy: 0 };
   for (const r of flagged) counts[r.severity]++;
   const acpl = mine.length
-    ? Math.round(mine.reduce((s, r) => s + Math.min(1000, Math.max(0, r.drop)), 0) / mine.length)
+    ? Math.round(mine.reduce((s, r) => s + (r.exonerated ? 0 : Math.min(1000, Math.max(0, r.drop))), 0) / mine.length)
     : 0;
 
   return {

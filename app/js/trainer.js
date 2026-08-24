@@ -54,6 +54,8 @@ export function buildQueue(games, analyses, progress, { now = 0, includeInaccura
         myColor: g.myColor,
         record: r,
         next: a.records[i + 1] || null,
+        depth: a.depth, // grade the answer at the depth this game was judged at
+
         box: card ? card.box : 0,
         seen: card ? card.seen : 0,
       });

@@ -696,13 +696,14 @@ function renderGame(uuid) {
   }
 
   // Judge the position the exploration has reached, and show the reply the
-  // engine would make. Skipped while the automatic review still owns the engine.
+  // engine would make. Requests queue behind a running review rather than being
+  // dropped, so the panel still fills in while the game is being analysed.
   async function scoreExplore() {
-    if (ctrl) return;
     const mine = explore;
     try {
       const eng = await getEngine();
-      const info = await eng.evalPosition(mine.chess.fen(), 12);
+      // Same depth as the game analysis, so the comparison below is like for like.
+      const info = await eng.evalPosition(mine.chess.fen(), (analysis && analysis.depth) || S.depth);
       if (explore !== mine) return; // moved on since
       const stm = mine.chess.turn();
       const cp = info.type === 'mate'
@@ -1677,7 +1678,9 @@ async function renderTrain() {
       $('#t-feedback').innerHTML = `<div class="card sub">Checking your move…</div>`;
       try {
         const eng = await getEngine();
-        const info = await eng.evalPosition(chess.fen(), 12);
+        // Must match the depth r.before was searched at, or the difference is
+        // mostly depth delta and a fine move gets graded wrong.
+        const info = await eng.evalPosition(chess.fen(), puzzle.depth || S.depth);
         // score is from the new side-to-move's view; flip to yours
         const mine = info.type === 'mate'
           ? (info.value > 0 ? -(MATE_CP - info.value) : MATE_CP + info.value)
