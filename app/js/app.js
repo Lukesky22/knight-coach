@@ -70,7 +70,20 @@ function agoText(ts) {
   return `${Math.round(secs / 86400)} d ago`;
 }
 
+function syncTabBar() {
+  const bar = document.getElementById('tabbar');
+  if (!bar) return;
+  // hidden during setup and while reviewing a game, where the screen is
+  // already full and the back arrow is the natural way out
+  const inGame = location.hash.startsWith('#g/') || location.hash === '#drill';
+  bar.hidden = !S.user || inGame;
+  for (const a of bar.querySelectorAll('a')) {
+    a.classList.toggle('on', a.dataset.tab === (location.hash || ''));
+  }
+}
+
 function route() {
+  syncTabBar();
   if (!S.user) { renderSetup(); return; }
   const m = location.hash.match(/^#g\/(.+)$/);
   if (m) renderGame(decodeURIComponent(m[1]));
@@ -406,10 +419,12 @@ function renderGame(uuid) {
       <a class="btn small" href="${esc(g.url)}" target="_blank" rel="noopener">↗</a>
     </header>
 
+    <div id="strip-top" class="player-strip"></div>
     <div class="board-wrap">
       <div class="evalbar"><div id="evalfill"></div></div>
       <div id="board"></div>
     </div>
+    <div id="strip-bottom" class="player-strip"></div>
 
     <div class="controls">
       <button class="btn nav" id="nav-start">⏮</button>
@@ -442,6 +457,55 @@ function renderGame(uuid) {
     renderReview();
   }
 
+  const PIECE_VALUE = { p: 1, n: 3, b: 3, r: 5, q: 9 };
+  const START_COUNT = { p: 8, n: 2, b: 2, r: 2, q: 1 };
+
+  // Which pieces each side has captured, and who is up on material.
+  function capturedAt(fen) {
+    const board = fen.split(' ')[0];
+    const left = { w: { p: 0, n: 0, b: 0, r: 0, q: 0 }, b: { p: 0, n: 0, b: 0, r: 0, q: 0 } };
+    for (const ch of board) {
+      const lower = ch.toLowerCase();
+      if (!(lower in PIECE_VALUE)) continue;
+      left[ch === ch.toUpperCase() ? 'w' : 'b'][lower]++;
+    }
+    const out = { w: [], b: [], score: 0 };
+    for (const type of ['q', 'r', 'b', 'n', 'p']) {
+      for (const side of ['w', 'b']) {
+        const gone = START_COUNT[type] - left[side][type];
+        for (let i = 0; i < gone; i++) {
+          // a white piece missing is a capture *by* Black
+          out[side === 'w' ? 'b' : 'w'].push(`${side}${type.toUpperCase()}`);
+        }
+        out.score += (side === 'w' ? -1 : 1) * gone * PIECE_VALUE[type];
+      }
+    }
+    return out; // score > 0 means White is up
+  }
+
+  function renderStrips() {
+    const cap = capturedAt(fenAt(idx));
+    const meTop = g.myColor === 'b'; // board is flipped when you are Black
+    const rows = [
+      { side: meTop ? 'w' : 'b', el: $('#strip-top') },
+      { side: meTop ? 'b' : 'w', el: $('#strip-bottom') },
+    ];
+    for (const { side, el } of rows) {
+      if (!el) continue;
+      const isMe = side === g.myColor;
+      const name = isMe ? S.user : g.oppName;
+      const rating = isMe ? g.myRating : g.oppRating;
+      const lead = side === 'w' ? cap.score : -cap.score;
+      el.innerHTML = `
+        <span class="dot ${side === 'w' ? 'wdot' : 'bdot'}"></span>
+        <span class="pname">${esc(name)}</span>
+        <span class="prating">${rating}</span>
+        <span class="captured">${cap[side].map((c) =>
+          `<img src="pieces/${c}.svg" alt="">`).join('')}</span>
+        ${lead > 0 ? `<span class="lead">+${lead}</span>` : ''}`;
+    }
+  }
+
   // Board for the move you are standing on: the move played in red, and the
   // move that was better in green whenever they differ.
   function drawCurrent() {
@@ -459,6 +523,7 @@ function renderGame(uuid) {
       lastMove: idx > 0 ? [moves[idx - 1].from, moves[idx - 1].to] : null,
       arrows,
     });
+    renderStrips();
   }
 
   // Rewind one ply and walk through what the engine wanted, so the improvement

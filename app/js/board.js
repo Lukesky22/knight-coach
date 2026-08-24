@@ -40,6 +40,9 @@ export class Board {
     this.pieceLayer = document.createElement('div');
     this.pieceLayer.className = 'piece-layer';
     el.appendChild(this.pieceLayer);
+    // square -> {el, code}, kept between renders so a piece that moves is the
+    // same DOM node and CSS can slide it instead of blinking
+    this.pieceEls = new Map();
 
     this.overlay = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     this.overlay.setAttribute('viewBox', '0 0 8 8');
@@ -121,27 +124,63 @@ export class Board {
       }
     }
 
-    this.pieceLayer.innerHTML = '';
+    // rank numbers down the left edge, file letters along the bottom
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const sq = this.squares[`${row},${col}`];
+        const name = this.squareAt(row, col);
+        sq.dataset.rank = col === 0 ? name[1] : '';
+        sq.dataset.file = row === 7 ? name[0] : '';
+      }
+    }
+
+    // Work out where every piece belongs, then reconcile against what is
+    // already on screen so moving pieces keep their element and animate.
+    const wanted = new Map(); // square -> code like "wN"
     const rows = this.fen.split(' ')[0].split('/');
     for (let r = 0; r < 8; r++) { // r=0 is rank 8
       let file = 0;
       for (const ch of rows[r]) {
         if (/\d/.test(ch)) { file += parseInt(ch, 10); continue; }
         const color = ch === ch.toUpperCase() ? 'w' : 'b';
-        const type = ch.toUpperCase();
-        const rank = 7 - r;
-        const disp = this.flip
-          ? { row: rank, col: 7 - file }
-          : { row: r, col: file };
-        const img = document.createElement('img');
-        img.src = `pieces/${color}${type}.svg`;
-        img.alt = color + type;
-        img.className = 'piece';
-        img.style.transform = `translate(${disp.col * 100}%, ${disp.row * 100}%)`;
-        this.pieceLayer.appendChild(img);
+        wanted.set(`${FILES[file]}${8 - r}`, color + ch.toUpperCase());
         file++;
       }
     }
+
+    const place = (el, square) => {
+      const { row, col } = this.coords(square);
+      el.style.transform = `translate(${col * 100}%, ${row * 100}%)`;
+    };
+
+    // 1. drop pieces that are no longer anywhere they used to be
+    const leftovers = [];
+    for (const [square, entry] of this.pieceEls) {
+      if (wanted.get(square) === entry.code) continue;
+      this.pieceEls.delete(square);
+      leftovers.push(entry);
+    }
+    // 2. fill squares that need a piece, reusing a matching orphan when we can
+    for (const [square, code] of wanted) {
+      const existing = this.pieceEls.get(square);
+      if (existing && existing.code === code) { place(existing.el, square); continue; }
+      const reuseIdx = leftovers.findIndex((o) => o.code === code);
+      let entry;
+      if (reuseIdx >= 0) {
+        entry = leftovers.splice(reuseIdx, 1)[0];
+      } else {
+        const img = document.createElement('img');
+        img.src = `pieces/${code[0]}${code[1]}.svg`;
+        img.alt = code;
+        img.className = 'piece';
+        this.pieceLayer.appendChild(img);
+        entry = { el: img, code };
+      }
+      place(entry.el, square);
+      this.pieceEls.set(square, entry);
+    }
+    // 3. anything still orphaned was captured
+    for (const o of leftovers) o.el.remove();
 
     this.overlay.innerHTML = '';
     for (const a of this.arrows) this.drawArrow(a);
