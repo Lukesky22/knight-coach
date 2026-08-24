@@ -422,6 +422,7 @@ function renderGame(uuid) {
   let analysis = S.analyses.get(uuid) || null;
   let idx = 0; // 0 = starting position, i = after move i
   let ctrl = null; // AbortController for single-game analysis
+  let explore = null; // set while you are trying your own moves on the board
 
   const resultText = { W: 'You won', L: 'You lost', D: 'Draw' }[g.resultForMe];
 
@@ -450,6 +451,7 @@ function renderGame(uuid) {
       <button class="btn nav" id="nav-end">⏭</button>
     </div>
 
+    <div class="jumprow" id="jumprow"></div>
     <div id="review"></div>
     <div id="graph-wrap"></div>
     <div class="card"><div class="movegrid" id="movegrid"></div></div>
@@ -465,12 +467,40 @@ function renderGame(uuid) {
 
   function goTo(newIdx) {
     if (playingLine) return;
+    explore = null; // stepping through the game leaves any side line
     idx = Math.max(0, Math.min(moves.length, newIdx));
     drawCurrent();
     for (const el of document.querySelectorAll('.mv')) el.classList.remove('cur');
     if (idx > 0) $(`.mv[data-i="${idx}"]`)?.classList.add('cur');
     updateEvalUI();
     renderReview();
+    renderJumpRow();
+  }
+
+  // Stepping one ply at a time to find your own errors is a chore; these skip
+  // straight to them.
+  function myMistakeIndexes() {
+    if (!analysis) return [];
+    return analysis.records
+      .filter((r) => r.mover === g.myColor && r.severity && r.severity !== 'inaccuracy')
+      .map((r) => r.i);
+  }
+
+  function renderJumpRow() {
+    const row = $('#jumprow');
+    if (!row) return;
+    const spots = myMistakeIndexes();
+    if (!spots.length) { row.innerHTML = ''; return; }
+    const prev = [...spots].reverse().find((i) => i < idx);
+    const next = spots.find((i) => i > idx);
+    const pos = spots.indexOf(idx);
+    row.innerHTML = `
+      <button class="btn small" id="jump-prev" ${prev === undefined ? 'disabled' : ''}>‹ mistake</button>
+      <span class="sub">${pos >= 0 ? `your mistake ${pos + 1} of ${spots.length}` : `${spots.length} of your mistakes`}</span>
+      <button class="btn small" id="jump-next" ${next === undefined ? 'disabled' : ''}>mistake ›</button>`;
+    const p = $('#jump-prev'), n = $('#jump-next');
+    if (p && prev !== undefined) p.onclick = () => goTo(prev);
+    if (n && next !== undefined) n.onclick = () => goTo(next);
   }
 
   const PIECE_VALUE = { p: 1, n: 3, b: 3, r: 5, q: 9 };
@@ -522,24 +552,94 @@ function renderGame(uuid) {
     }
   }
 
-  // Board for the move you are standing on: the move played in red, and the
-  // move that was better in green whenever they differ.
+  // The engine's choice FROM the position you are looking at. records[i] is the
+  // move played from position i, so its PV is what was best standing here.
+  function bestUciAt(i) {
+    return analysis && analysis.records[i] ? analysis.records[i].bestUci : null;
+  }
+
+  const exploreLegal = (sq) => {
+    const c = explore ? explore.chess : new Chess(fenAt(idx));
+    return c.moves({ square: sq, verbose: true }).map((m) => m.to);
+  };
+
+  // Every position shows the best move in green, and the board always accepts
+  // a move so you can try your own ideas from anywhere in the game.
   function drawCurrent() {
-    const rec = recAt(idx);
+    if (explore) { drawExplore(); return; }
     const arrows = [];
-    if (rec) {
-      const bestSame = rec.bestUci
-        && rec.bestUci.slice(0, 4) === `${rec.played.from}${rec.played.to}`;
-      if (!bestSame && rec.bestUci && rec.drop >= 20) {
-        arrows.push({ from: rec.played.from, to: rec.played.to, kind: 'played' });
-        arrows.push({ from: rec.bestUci.slice(0, 2), to: rec.bestUci.slice(2, 4), kind: 'best' });
-      }
+    const best = bestUciAt(idx);
+    if (best) {
+      arrows.push({ from: best.slice(0, 2), to: best.slice(2, 4), kind: 'best' });
     }
     board.position(fenAt(idx), {
       lastMove: idx > 0 ? [moves[idx - 1].from, moves[idx - 1].to] : null,
       arrows,
     });
+    board.setInteractive(true, { legalFrom: exploreLegal, onMove: startExplore });
     renderStrips();
+  }
+
+  function drawExplore() {
+    const h = explore.chess.history({ verbose: true });
+    const last = h[h.length - 1];
+    board.position(explore.chess.fen(), {
+      lastMove: last ? [last.from, last.to] : null,
+      arrows: explore.bestReply
+        ? [{ from: explore.bestReply.slice(0, 2), to: explore.bestReply.slice(2, 4), kind: 'best' }]
+        : [],
+    });
+    board.setInteractive(true, { legalFrom: exploreLegal, onMove: playInExplore });
+    renderStrips();
+  }
+
+  function startExplore({ from, to }) {
+    const c = new Chess(fenAt(idx));
+    let mv;
+    try { mv = c.move({ from, to, promotion: 'q' }); } catch { return; }
+    if (!mv) return;
+    explore = { chess: c, from: idx, sans: [mv.san], bestReply: null, evalCp: null };
+    drawExplore();
+    renderReview();
+    scoreExplore();
+  }
+
+  function playInExplore({ from, to }) {
+    let mv;
+    try { mv = explore.chess.move({ from, to, promotion: 'q' }); } catch { return; }
+    if (!mv) return;
+    explore.sans.push(mv.san);
+    explore.bestReply = null;
+    drawExplore();
+    renderReview();
+    scoreExplore();
+  }
+
+  // Judge the position the exploration has reached, and show the reply the
+  // engine would make. Skipped while the automatic review still owns the engine.
+  async function scoreExplore() {
+    if (ctrl) return;
+    const mine = explore;
+    try {
+      const eng = await getEngine();
+      const info = await eng.evalPosition(mine.chess.fen(), 12);
+      if (explore !== mine) return; // moved on since
+      const stm = mine.chess.turn();
+      const cp = info.type === 'mate'
+        ? (info.value > 0 ? MATE_CP - info.value : -(MATE_CP + info.value))
+        : info.value;
+      mine.evalCp = stm === 'w' ? cp : -cp; // White's viewpoint, like everything else
+      mine.bestReply = info.pv && info.pv.length ? info.pv[0] : null;
+      drawExplore();
+      renderReview();
+    } catch { /* leave the panel as it is */ }
+  }
+
+  function leaveExplore() {
+    explore = null;
+    drawCurrent();
+    renderReview();
+    updateEvalUI();
   }
 
   // Rewind one ply and walk through what the engine wanted, so the improvement
@@ -588,12 +688,45 @@ function renderGame(uuid) {
         </div>`;
       return;
     }
+    if (explore) {
+      const baseEval = analysis.evals[explore.from];
+      const lost = explore.evalCp === null ? null
+        : (g.myColor === 'w' ? baseEval - explore.evalCp : explore.evalCp - baseEval);
+      panel.innerHTML = `
+        <div class="card review-card ${lost !== null && lost >= THRESHOLD ? 'mistake' : 'best'}">
+          <div class="review-head">
+            <div><span class="verdict">Your line</span>
+              <b class="review-move">${esc(explore.sans.join(' '))}</b></div>
+            <span class="sub">trying it out</span>
+          </div>
+          ${explore.evalCp === null
+            ? `<p class="sub">Working out how good that is…</p>`
+            : `<p class="why">Position is now <b>${esc(fmtEval(explore.evalCp))}</b>${
+                lost !== null
+                  ? lost >= THRESHOLD
+                    ? ` — that costs you about ${(lost / 100).toFixed(1)} pawns compared with the game position.`
+                    : lost <= -50
+                      ? ` — that is actually better for you than the game by ${(-lost / 100).toFixed(1)} pawns.`
+                      : ' — about the same as the game position.'
+                  : ''
+              }</p>`}
+          ${explore.bestReply ? `<p class="sub">Green shows the reply the engine would make.</p>` : ''}
+          <div class="row">
+            <button class="btn small" id="ex-back">← Back to the game</button>
+          </div>
+        </div>`;
+      const back = $('#ex-back');
+      if (back) back.onclick = leaveExplore;
+      return;
+    }
+
     const rec = recAt(idx);
     if (!rec) {
       panel.innerHTML = `<div class="card">
         <h2>Starting position</h2>
-        <p class="sub">Step forward with ▶ or swipe the board. Every move you made gets a
-        verdict, and when there was something better you will see it in green.</p>
+        <p class="sub">The green arrow is the engine's move for whatever position you are
+        looking at. Step through with ▶, or just move a piece on the board to try your own
+        idea and see what it is worth.</p>
       </div>`;
       return;
     }
@@ -627,12 +760,14 @@ function renderGame(uuid) {
           </div>
           <div class="sub" id="line-status"></div>
           <div id="coach-text"></div>
-        ` : bad ? `
-          <p class="why">${esc(g.oppName)} slipped here — ${rich(explainMistake(rec, nextRec))}</p>
+        ` : !isMine ? `
+          <p class="sub">${bad
+            ? `${esc(g.oppName)} slipped here, which is why the evaluation moved your way.`
+            : `${esc(g.oppName)}'s move. Nothing for you to do about it.`}</p>
         ` : verdict === 'best' ? `
           <p class="why">You found the engine's first choice.</p>
         ` : `
-          <p class="why">Fine. The evaluation barely moved${rec.bestLine ? `; the engine's line was ${esc(rec.bestLine)}` : ''}.</p>
+          <p class="why">Fine — the evaluation barely moved.</p>
         `}
 
         ${notes.length ? `<div class="notes-block">
