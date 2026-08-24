@@ -1329,7 +1329,11 @@ if ('serviceWorker' in navigator && window.isSecureContext) {
     reloading = true;
     location.reload();
   });
-  navigator.serviceWorker.register('sw.js')
+  // updateViaCache: 'none' keeps the browser from serving sw.js itself out of
+  // the HTTP cache. GitHub Pages sets max-age on everything, so without this
+  // the worker that decides how everything else is cached is the one file that
+  // can never be refreshed.
+  navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' })
     .then((reg) => reg.update())
     .catch(() => {});
 }

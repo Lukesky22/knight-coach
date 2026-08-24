@@ -2,7 +2,7 @@
 // instantly (and offline) from the home screen. Chess.com API calls are
 // never cached here - game data lives in IndexedDB.
 
-const VERSION = 'kc-v7';
+const VERSION = 'kc-v8';
 
 const PRECACHE = [
   '.',
