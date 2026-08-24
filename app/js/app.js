@@ -1319,6 +1319,18 @@ async function renderTrain() {
 // Offline caching needs a secure context (https, or localhost during dev).
 // Over plain http on the LAN the app still works; it just isn't cached.
 if ('serviceWorker' in navigator && window.isSecureContext) {
-  navigator.serviceWorker.register('sw.js').catch(() => {});
+  // A worker that never checks for a newer version leaves the phone running
+  // whatever code it first installed. Ask on every load, and when a new one
+  // takes over (the worker calls skipWaiting + claim), reload once so the
+  // page is actually running the code that just arrived.
+  let reloading = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (reloading) return;
+    reloading = true;
+    location.reload();
+  });
+  navigator.serviceWorker.register('sw.js')
+    .then((reg) => reg.update())
+    .catch(() => {});
 }
 boot();
