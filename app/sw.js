@@ -2,7 +2,7 @@
 // instantly (and offline) from the home screen. Chess.com API calls are
 // never cached here - game data lives in IndexedDB.
 
-const VERSION = 'kc-v6';
+const VERSION = 'kc-v7';
 
 const PRECACHE = [
   '.',
@@ -51,8 +51,13 @@ function cacheFirst(req) {
 }
 
 // Fresh when online, cached when not.
+//
+// The fetch must bypass the browser's own HTTP cache. GitHub Pages serves
+// these files with a max-age, so a plain fetch() here can be answered from
+// that cache and hand back a stale copy - "network first" that quietly is
+// not. `no-cache` still allows a 304, so this costs almost nothing.
 function networkFirst(req) {
-  return fetch(req)
+  return fetch(req.url, { cache: 'no-cache' })
     .then((res) => {
       if (res.ok) {
         const copy = res.clone();
