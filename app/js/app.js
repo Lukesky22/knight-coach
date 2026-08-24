@@ -1,0 +1,564 @@
+// Knight Coach — app shell, views, replay, and coach UI.
+
+import { idbGet, idbPut, idbGetAll } from './db.js';
+import { getProfile, syncGames, loadCachedGames } from './chesscom.js';
+import { Board } from './board.js';
+import { analyzeGame, parseGame, fmtEval, isMateScore, MATE_CP, THRESHOLD } from './analysis.js';
+
+const $ = (sel, el = document) => el.querySelector(sel);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => (
+  { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+));
+
+const S = {
+  user: localStorage.getItem('kc.user') || '',
+  depth: parseInt(localStorage.getItem('kc.depth') || '14', 10),
+  games: [],
+  analyses: new Map(), // uuid -> analysis result
+  bulk: null,          // AbortController while "analyze all" runs
+};
+
+const SEV_LABEL = { blunder: 'Blunder', mistake: 'Mistake', inaccuracy: 'Inaccuracy' };
+const SEV_ORDER = ['blunder', 'mistake', 'inaccuracy'];
+
+// ---------------------------------------------------------------- boot
+
+async function boot() {
+  window.addEventListener('hashchange', route);
+  if (!S.user) { renderSetup(); return; }
+  await loadAccount();
+  route();
+}
+
+async function loadAccount() {
+  const view = $('#view');
+  view.innerHTML = `<div class="center-note">Loading your games…</div>`;
+  for (const [uuid, a] of await idbGetAll('analyses')) S.analyses.set(uuid, a);
+  try {
+    S.games = await syncGames(S.user, (i, n) => {
+      view.innerHTML = `<div class="center-note">Fetching archives ${i}/${n}…</div>`;
+    });
+    S.offline = false;
+  } catch (err) {
+    console.error(err);
+    S.games = await loadCachedGames(S.user);
+    S.offline = true;
+  }
+}
+
+function route() {
+  if (!S.user) { renderSetup(); return; }
+  const m = location.hash.match(/^#g\/(.+)$/);
+  if (m) renderGame(decodeURIComponent(m[1]));
+  else renderHome();
+}
+
+// ---------------------------------------------------------------- setup
+
+function renderSetup() {
+  $('#view').innerHTML = `
+    <div class="setup">
+      <div class="logo">♞</div>
+      <h1>Knight Coach</h1>
+      <p>Your games, reviewed by Stockfish, on your phone. Free.</p>
+      <input id="user-in" placeholder="Chess.com username" autocapitalize="none" autocorrect="off" />
+      <button id="user-go" class="btn primary">Load my games</button>
+      <div id="setup-err" class="err"></div>
+    </div>`;
+  const go = async () => {
+    const u = $('#user-in').value.trim();
+    if (!u) return;
+    $('#user-go').disabled = true;
+    $('#setup-err').textContent = '';
+    try {
+      const p = await getProfile(u);
+      S.user = p.username;
+      localStorage.setItem('kc.user', p.username);
+      await loadAccount();
+      route();
+    } catch {
+      $('#setup-err').textContent = `Couldn't find "${esc(u)}" on Chess.com.`;
+      $('#user-go').disabled = false;
+    }
+  };
+  $('#user-go').onclick = go;
+  $('#user-in').onkeydown = (e) => { if (e.key === 'Enter') go(); };
+}
+
+// ---------------------------------------------------------------- home
+
+function record(games) {
+  const r = { W: 0, L: 0, D: 0 };
+  for (const g of games) r[g.resultForMe]++;
+  return r;
+}
+
+function sparkline(values, w = 320, h = 48) {
+  if (values.length < 2) return '';
+  const min = Math.min(...values), max = Math.max(...values);
+  const span = max - min || 1;
+  const pts = values.map((v, i) => {
+    const x = (i / (values.length - 1)) * (w - 4) + 2;
+    const y = h - 4 - ((v - min) / span) * (h - 8);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+    <polyline points="${pts.join(' ')}" />
+  </svg>
+  <div class="spark-caption">${min} → ${values[values.length - 1]} rating</div>`;
+}
+
+function coachNotes() {
+  const analyzed = S.games.filter((g) => S.analyses.has(g.uuid));
+  if (analyzed.length < 3) return '';
+  const phase = { opening: 0, middlegame: 0, endgame: 0 };
+  const perOpening = new Map();
+  let flaggedTotal = 0, acplSum = 0;
+  const acplByGame = [];
+  for (const g of analyzed) {
+    const a = S.analyses.get(g.uuid);
+    acplSum += a.summary.acpl;
+    acplByGame.push({ t: g.endTime, acpl: a.summary.acpl });
+    const bad = a.records.filter((r) => r.mover === g.myColor && r.severity);
+    flaggedTotal += bad.length;
+    for (const r of bad) phase[r.phase]++;
+    // Group by opening family ("Sicilian Defense Chekhover Variation" ->
+    // "Sicilian Defense") so each bucket has enough games to mean something.
+    const family = g.opening.split(' ').slice(0, 2).join(' ');
+    const o = perOpening.get(family) || { games: 0, bad: 0 };
+    o.games++; o.bad += bad.filter((r) => r.severity !== 'inaccuracy').length;
+    perOpening.set(family, o);
+  }
+  const notes = [];
+  const avg = Math.round(acplSum / analyzed.length);
+  notes.push(`Average centipawn loss over ${analyzed.length} analyzed games: <b>${avg}</b> (lower is better; ~50 is club level).`);
+  if (flaggedTotal) {
+    const worstPhase = Object.entries(phase).sort((a, b) => b[1] - a[1])[0];
+    notes.push(`Most of your mistakes come in the <b>${worstPhase[0]}</b> (${Math.round((worstPhase[1] / flaggedTotal) * 100)}% of ${flaggedTotal} flagged moves).`);
+  }
+  const leaky = [...perOpening.entries()]
+    .filter(([, o]) => o.games >= 4)
+    .sort((a, b) => b[1].bad / b[1].games - a[1].bad / a[1].games)[0];
+  if (leaky) {
+    const per = (leaky[1].bad / leaky[1].games).toFixed(1);
+    notes.push(`Biggest leak: <b>${esc(leaky[0])}</b> — ${per} serious mistakes per game across ${leaky[1].games} games.`);
+  }
+  if (acplByGame.length >= 6) {
+    acplByGame.sort((a, b) => a.t - b.t);
+    const half = Math.floor(acplByGame.length / 2);
+    const early = Math.round(acplByGame.slice(0, half).reduce((s, x) => s + x.acpl, 0) / half);
+    const late = Math.round(acplByGame.slice(half).reduce((s, x) => s + x.acpl, 0) / (acplByGame.length - half));
+    if (late < early - 5) notes.push(`You're improving: ACPL fell from ${early} (older games) to ${late} (recent).`);
+    else if (late > early + 5) notes.push(`Recent games are sloppier: ACPL rose from ${early} to ${late}. Slow down.`);
+  }
+  return `<div class="card"><h2>Coach's notes</h2><ul class="notes">${notes.map((n) => `<li>${n}</li>`).join('')}</ul></div>`;
+}
+
+function renderHome() {
+  const g = S.games;
+  const rec = record(g);
+  const white = record(g.filter((x) => x.myColor === 'w'));
+  const black = record(g.filter((x) => x.myColor === 'b'));
+  const chrono = [...g].sort((a, b) => a.endTime - b.endTime);
+  const ratings = chrono.filter((x) => x.rated).map((x) => x.myRating);
+  const analyzedCount = g.filter((x) => S.analyses.has(x.uuid)).length;
+
+  const openings = new Map();
+  for (const x of g) {
+    const o = openings.get(x.opening) || { n: 0, W: 0, L: 0, D: 0 };
+    o.n++; o[x.resultForMe]++;
+    openings.set(x.opening, o);
+  }
+  const topOpenings = [...openings.entries()].sort((a, b) => b[1].n - a[1].n).slice(0, 5);
+
+  $('#view').innerHTML = `
+    <header class="top">
+      <div>
+        <h1>♞ Knight Coach</h1>
+        <div class="sub">${esc(S.user)} · ${g.length} games${S.offline ? ' · offline (cached)' : ''}</div>
+      </div>
+      <button id="sync" class="btn small">Sync</button>
+    </header>
+
+    <div class="card">
+      <div class="rec-row">
+        <div class="rec"><b>${rec.W}</b><span>wins</span></div>
+        <div class="rec"><b>${rec.L}</b><span>losses</span></div>
+        <div class="rec"><b>${rec.D}</b><span>draws</span></div>
+      </div>
+      <div class="color-rec">As White: ${white.W}-${white.L}-${white.D} · As Black: ${black.W}-${black.L}-${black.D}</div>
+      ${sparkline(ratings)}
+    </div>
+
+    <div class="card">
+      <div class="row-between">
+        <h2>Analysis</h2>
+        <span class="sub">${analyzedCount}/${g.length} games</span>
+      </div>
+      <div class="row">
+        <label class="sub">Depth
+          <select id="depth">${[10, 12, 14, 16, 18].map((d) =>
+            `<option ${d === S.depth ? 'selected' : ''}>${d}</option>`).join('')}
+          </select>
+        </label>
+        <button id="bulk" class="btn small">${S.bulk ? 'Stop' : 'Analyze all'}</button>
+      </div>
+      <div id="bulk-status" class="sub"></div>
+      <div class="progress" id="bulk-bar-wrap" ${S.bulk ? '' : 'hidden'}><div id="bulk-bar"></div></div>
+    </div>
+
+    ${coachNotes()}
+
+    ${topOpenings.length ? `<div class="card"><h2>Your openings</h2>
+      ${topOpenings.map(([name, o]) => `
+        <div class="opening-row">
+          <div class="opening-name">${esc(name)}</div>
+          <div class="opening-stat">${o.W}-${o.L}-${o.D}</div>
+          <div class="wlbar"><i style="width:${(o.W / o.n) * 100}%"></i><u style="width:${(o.D / o.n) * 100}%"></u></div>
+        </div>`).join('')}
+    </div>` : ''}
+
+    <div class="card">
+      <h2>Games</h2>
+      <div class="games">
+        ${g.map((x) => {
+          const a = S.analyses.get(x.uuid);
+          const badge = a
+            ? `<span class="badge done">d${a.depth} · ${a.summary.counts.blunder}B ${a.summary.counts.mistake}M</span>`
+            : (x.rules === 'chess' ? '' : `<span class="badge">variant</span>`);
+          return `
+          <a class="game res-${x.resultForMe}" href="#g/${encodeURIComponent(x.uuid)}">
+            <span class="res">${x.resultForMe}</span>
+            <span class="dot ${x.myColor === 'w' ? 'wdot' : 'bdot'}"></span>
+            <span class="opp">${esc(x.oppName)} <i>(${x.oppRating})</i></span>
+            <span class="meta">${esc(x.opening)}</span>
+            <span class="when">${new Date(x.endTime * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}${badge}</span>
+          </a>`;
+        }).join('')}
+      </div>
+    </div>
+
+    <div class="foot">
+      <a href="#" id="switch">Switch account</a>
+    </div>`;
+
+  $('#sync').onclick = async () => { await loadAccount(); route(); };
+  $('#switch').onclick = (e) => {
+    e.preventDefault();
+    localStorage.removeItem('kc.user');
+    S.user = ''; S.games = [];
+    renderSetup();
+  };
+  $('#depth').onchange = (e) => {
+    S.depth = parseInt(e.target.value, 10);
+    localStorage.setItem('kc.depth', String(S.depth));
+  };
+  $('#bulk').onclick = () => (S.bulk ? S.bulk.abort() : analyzeAll());
+}
+
+async function analyzeAll() {
+  const todo = S.games.filter((g) => g.rules === 'chess' && !S.analyses.has(g.uuid));
+  if (!todo.length) return;
+  S.bulk = new AbortController();
+  // Re-query the progress elements on every update: the user may navigate to a
+  // game view and back mid-run, which replaces this DOM.
+  const btn = $('#bulk');
+  if (btn) btn.textContent = 'Stop';
+  const wrap = $('#bulk-bar-wrap');
+  if (wrap) wrap.hidden = false;
+  try {
+    for (let i = 0; i < todo.length; i++) {
+      const g = todo[i];
+      const status = $('#bulk-status');
+      if (status) status.textContent = `Game ${i + 1}/${todo.length}: vs ${g.oppName}`;
+      const a = await analyzeGame({
+        pgn: g.pgn, myColor: g.myColor, depth: S.depth, signal: S.bulk.signal,
+        onProgress: (p, n) => {
+          const bar = $('#bulk-bar');
+          if (bar) bar.style.width = `${((i + p / n) / todo.length) * 100}%`;
+        },
+      });
+      await idbPut('analyses', g.uuid, a);
+      S.analyses.set(g.uuid, a);
+    }
+  } catch (err) {
+    if (!err.cancelled) console.error(err);
+  }
+  S.bulk = null;
+  if (location.hash === '' || location.hash === '#') renderHome();
+}
+
+// ---------------------------------------------------------------- game view
+
+function renderGame(uuid) {
+  const g = S.games.find((x) => x.uuid === uuid);
+  if (!g) { location.hash = ''; return; }
+
+  let parsed;
+  try {
+    parsed = parseGame(g.pgn);
+  } catch (err) {
+    $('#view').innerHTML = `<div class="center-note">Couldn't parse this game (${esc(err.message)}). <a href="#">Back</a></div>`;
+    return;
+  }
+  const { moves, startFen } = parsed;
+  let analysis = S.analyses.get(uuid) || null;
+  let idx = 0; // 0 = starting position, i = after move i
+  let ctrl = null; // AbortController for single-game analysis
+
+  const resultText = { W: 'You won', L: 'You lost', D: 'Draw' }[g.resultForMe];
+
+  $('#view').innerHTML = `
+    <header class="top">
+      <a class="btn small" href="#">←</a>
+      <div>
+        <h1>vs ${esc(g.oppName)} (${g.oppRating})</h1>
+        <div class="sub">${resultText} · ${esc(g.myResultCode)} · ${esc(g.opening)}</div>
+      </div>
+      <a class="btn small" href="${esc(g.url)}" target="_blank" rel="noopener">↗</a>
+    </header>
+
+    <div class="board-wrap">
+      <div class="evalbar"><div id="evalfill"></div></div>
+      <div id="board"></div>
+    </div>
+
+    <div class="controls">
+      <button class="btn nav" id="nav-start">⏮</button>
+      <button class="btn nav" id="nav-prev">◀</button>
+      <div class="eval-read" id="eval-read">—</div>
+      <button class="btn nav" id="nav-next">▶</button>
+      <button class="btn nav" id="nav-end">⏭</button>
+    </div>
+
+    <div id="graph-wrap"></div>
+    <div class="card"><div class="movegrid" id="movegrid"></div></div>
+    <div id="analyze-area"></div>
+    <div id="coach"></div>`;
+
+  const board = new Board($('#board'));
+  board.setFlip(g.myColor === 'b');
+
+  const flaggedByIdx = new Map(); // position index BEFORE the move -> record
+  const rebuildFlagMap = () => {
+    flaggedByIdx.clear();
+    if (!analysis) return;
+    for (const r of analysis.records) {
+      if (r.severity && r.mover === g.myColor) flaggedByIdx.set(r.i - 1, r);
+    }
+  };
+  rebuildFlagMap();
+
+  const fenAt = (i) => (i === 0 ? startFen : moves[i - 1].after);
+
+  function goTo(newIdx) {
+    idx = Math.max(0, Math.min(moves.length, newIdx));
+    const rec = flaggedByIdx.get(idx);
+    const arrows = [];
+    if (rec) {
+      arrows.push({ from: rec.played.from, to: rec.played.to, kind: 'played' });
+      if (rec.bestUci) arrows.push({ from: rec.bestUci.slice(0, 2), to: rec.bestUci.slice(2, 4), kind: 'best' });
+    }
+    board.position(fenAt(idx), {
+      lastMove: idx > 0 ? [moves[idx - 1].from, moves[idx - 1].to] : null,
+      arrows,
+    });
+    for (const el of document.querySelectorAll('.mv')) el.classList.remove('cur');
+    if (idx > 0) $(`.mv[data-i="${idx}"]`)?.classList.add('cur');
+    updateEvalUI();
+  }
+
+  function updateEvalUI() {
+    const read = $('#eval-read');
+    const fill = $('#evalfill');
+    if (analysis && analysis.evals[idx] !== undefined) {
+      const v = analysis.evals[idx];
+      read.textContent = fmtEval(v);
+      const pct = isMateScore(v)
+        ? (v > 0 ? 100 : 0)
+        : 50 + 50 * (2 / (1 + Math.exp(-v / 400)) - 1);
+      fill.style.height = `${pct}%`;
+      const cursor = $('#graph-cursor');
+      if (cursor) cursor.setAttribute('x', String((idx / Math.max(1, moves.length)) * 320));
+    } else {
+      read.textContent = idx === 0 ? 'start' : `move ${Math.ceil(idx / 2)}`;
+      fill.style.height = '50%';
+    }
+  }
+
+  function renderMoveGrid() {
+    const grid = $('#movegrid');
+    let html = '';
+    for (let i = 0; i < moves.length; i += 2) {
+      html += `<span class="num">${i / 2 + 1}.</span>`;
+      for (const j of [i, i + 1]) {
+        if (j >= moves.length) break;
+        const r = analysis && analysis.records[j];
+        const dot = r && r.severity && r.mover === g.myColor ? `<i class="mdot ${r.severity}"></i>` : '';
+        html += `<span class="mv" data-i="${j + 1}">${esc(moves[j].san)}${dot}</span>`;
+      }
+    }
+    grid.innerHTML = html || '<span class="sub">No moves were played.</span>';
+    grid.onclick = (e) => {
+      const mv = e.target.closest('.mv');
+      if (mv) goTo(parseInt(mv.dataset.i, 10));
+    };
+  }
+
+  function renderGraph() {
+    const wrap = $('#graph-wrap');
+    if (!analysis || analysis.evals.length < 2) { wrap.innerHTML = ''; return; }
+    const w = 320, h = 60, n = analysis.evals.length;
+    const pts = analysis.evals.map((v, i) => {
+      const c = Math.max(-500, Math.min(500, isMateScore(v) ? Math.sign(v) * 500 : v));
+      const x = (i / (n - 1)) * w;
+      const y = h / 2 - (c / 500) * (h / 2 - 3);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    });
+    wrap.innerHTML = `
+      <svg class="evalgraph" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+        <rect x="0" y="0" width="${w}" height="${h / 2}" class="gwhite"/>
+        <rect x="0" y="${h / 2}" width="${w}" height="${h / 2}" class="gblack"/>
+        <line x1="0" y1="${h / 2}" x2="${w}" y2="${h / 2}" class="gmid"/>
+        <polyline points="${pts.join(' ')}" class="gline"/>
+        <rect id="graph-cursor" x="0" y="0" width="1.5" height="${h}" class="gcursor"/>
+      </svg>`;
+    const svg = wrap.firstElementChild;
+    svg.addEventListener('click', (e) => {
+      const box = svg.getBoundingClientRect();
+      const frac = (e.clientX - box.left) / box.width;
+      goTo(Math.round(frac * moves.length));
+    });
+  }
+
+  function renderAnalyzeArea() {
+    const area = $('#analyze-area');
+    if (g.rules !== 'chess') {
+      area.innerHTML = `<div class="card sub">Variant game (${esc(g.rules)}) — analysis works on standard chess only.</div>`;
+      return;
+    }
+    area.innerHTML = `
+      <div class="card">
+        <div class="row">
+          <label class="sub">Depth
+            <select id="g-depth">${[10, 12, 14, 16, 18].map((d) =>
+              `<option ${d === S.depth ? 'selected' : ''}>${d}</option>`).join('')}
+            </select>
+          </label>
+          <button id="g-analyze" class="btn primary">${analysis ? `Re-analyze (now d${analysis.depth})` : 'Analyze this game'}</button>
+        </div>
+        <div class="progress" id="g-bar-wrap" hidden><div id="g-bar"></div></div>
+      </div>`;
+    $('#g-depth').onchange = (e) => {
+      S.depth = parseInt(e.target.value, 10);
+      localStorage.setItem('kc.depth', String(S.depth));
+    };
+    $('#g-analyze').onclick = async () => {
+      const btn = $('#g-analyze');
+      if (ctrl) { ctrl.abort(); return; }
+      ctrl = new AbortController();
+      btn.textContent = 'Stop';
+      $('#g-bar-wrap').hidden = false;
+      try {
+        const a = await analyzeGame({
+          pgn: g.pgn, myColor: g.myColor, depth: S.depth, signal: ctrl.signal,
+          onProgress: (p, n) => { $('#g-bar').style.width = `${(p / n) * 100}%`; },
+        });
+        await idbPut('analyses', g.uuid, a);
+        S.analyses.set(g.uuid, a);
+        analysis = a;
+        rebuildFlagMap();
+        renderGraph(); renderMoveGrid(); renderCoach(); renderAnalyzeArea();
+        goTo(idx);
+      } catch (err) {
+        if (!err.cancelled) {
+          console.error(err);
+          $('#g-bar-wrap').hidden = true;
+          btn.textContent = 'Analyze this game';
+        } else {
+          renderAnalyzeArea();
+        }
+      }
+      ctrl = null;
+    };
+  }
+
+  function dropText(r) {
+    if (isMateScore(r.before) || isMateScore(r.after)) {
+      if (isMateScore(r.before) && r.before > 0 === (r.mover === 'w')) return 'missed a mate';
+      return 'allowed a mate';
+    }
+    return `lost ${(r.drop / 100).toFixed(2)} pawns`;
+  }
+
+  function renderCoach() {
+    const coach = $('#coach');
+    if (!analysis) { coach.innerHTML = ''; return; }
+    const flagged = analysis.records
+      .filter((r) => r.severity && r.mover === g.myColor)
+      .sort((a, b) => b.drop - a.drop);
+    const c = analysis.summary.counts;
+    coach.innerHTML = `
+      <div class="card">
+        <h2>Coach review <span class="sub">depth ${analysis.depth}</span></h2>
+        <div class="chips">
+          <span class="chip blunder">${c.blunder} blunders</span>
+          <span class="chip mistake">${c.mistake} mistakes</span>
+          <span class="chip inaccuracy">${c.inaccuracy} inaccuracies</span>
+          <span class="chip">ACPL ${analysis.summary.acpl}</span>
+        </div>
+        ${flagged.length ? flagged.map((r) => `
+          <div class="flagcard ${r.severity}" data-i="${r.i}">
+            <div class="flaghead">
+              <b>${esc(r.label)} ${esc(r.san)}</b>
+              <span class="sev ${r.severity}">${SEV_LABEL[r.severity]}</span>
+            </div>
+            <div class="sub">${dropText(r)} · eval ${fmtEval(r.before)} → ${fmtEval(r.after)} · ${r.phase}</div>
+            ${r.bestLine ? `<div class="bestline">Best was: <b>${esc(r.bestLine)}</b></div>` : ''}
+          </div>`).join('')
+        : `<p class="sub">No moves lost ${THRESHOLD}+ centipawns. Clean game — nice.</p>`}
+      </div>`;
+    coach.onclick = (e) => {
+      const card = e.target.closest('.flagcard');
+      if (!card) return;
+      goTo(parseInt(card.dataset.i, 10) - 1);
+      $('#board').scrollIntoView({ behavior: 'smooth', block: 'center' });
+    };
+  }
+
+  $('#nav-start').onclick = () => goTo(0);
+  $('#nav-prev').onclick = () => goTo(idx - 1);
+  $('#nav-next').onclick = () => goTo(idx + 1);
+  $('#nav-end').onclick = () => goTo(moves.length);
+
+  document.onkeydown = (e) => {
+    if (location.hash.startsWith('#g/')) {
+      if (e.key === 'ArrowLeft') goTo(idx - 1);
+      if (e.key === 'ArrowRight') goTo(idx + 1);
+    }
+  };
+
+  let touchX = null;
+  $('#board').addEventListener('touchstart', (e) => { touchX = e.touches[0].clientX; }, { passive: true });
+  $('#board').addEventListener('touchend', (e) => {
+    if (touchX === null) return;
+    const dx = e.changedTouches[0].clientX - touchX;
+    if (Math.abs(dx) > 40) goTo(idx + (dx < 0 ? 1 : -1));
+    touchX = null;
+  }, { passive: true });
+
+  renderGraph();
+  renderMoveGrid();
+  renderAnalyzeArea();
+  renderCoach();
+  goTo(0);
+}
+
+// ---------------------------------------------------------------- go
+
+// Offline caching needs a secure context (https, or localhost during dev).
+// Over plain http on the LAN the app still works; it just isn't cached.
+if ('serviceWorker' in navigator && window.isSecureContext) {
+  navigator.serviceWorker.register('sw.js').catch(() => {});
+}
+boot();
