@@ -36,7 +36,7 @@ export async function loadBook() {
       // what makes a drill play main lines instead of novelties.
       if (cur) cur.weight++;
       else m.set(moves[i], { name, weight: 1, names: [name] });
-      if (cur && cur.names.length < 8) cur.names.push(name);
+      if (cur && cur.names.length < 24) cur.names.push(name);
     }
   }
   return BOOK;
@@ -46,14 +46,33 @@ export async function loadBook() {
  * The book move to play from here, preferring main lines and, when a family is
  * given, continuations that actually stay inside that opening.
  */
-export function pickBookMove(sans, family = '') {
+export function pickBookMove(sans, family = '', rand = Math.random) {
   const { continuations } = bookAt(sans);
   if (!continuations.length) return null;
   const inFamily = family
     ? continuations.filter((c) => c.names.some((n) => n.startsWith(family)))
     : [];
   const pool = inFamily.length ? inFamily : continuations;
-  return pool.slice().sort((a, b) => b.weight - a.weight)[0];
+  // Weighted draw, not the single heaviest move. Always taking the top line
+  // means drilling the Sicilian plays the identical game every time; drawing at
+  // random lets real branches happen.
+  //
+  // Two corrections to a plain weighted draw, both so a drill still teaches
+  // theory: the weight is squared, so main lines dominate rather than merely
+  // leading, and anything under a twentieth of the most-played move is dropped
+  // as a novelty. Without that floor, a Sicilian drill answers 1...c5 with 2.Nh3.
+  const heaviest = pool.reduce((a, c) => Math.max(a, c.weight), 0);
+  const floor = heaviest / 20;
+  const main = pool.filter((c) => c.weight >= floor);
+  const draw = main.length ? main : pool;
+  const w = (c) => c.weight * c.weight;
+  const total = draw.reduce((a, c) => a + w(c), 0);
+  let roll = rand() * total;
+  for (const c of draw) {
+    roll -= w(c);
+    if (roll <= 0) return c;
+  }
+  return draw[draw.length - 1];
 }
 
 /**

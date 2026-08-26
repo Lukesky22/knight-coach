@@ -1604,6 +1604,10 @@ async function renderDrill() {
 // Accept anything that keeps the evaluation within this many centipawns.
 const NEAR_ENOUGH = 50;
 
+// Who you play against once you have found the move. Strong enough that the
+// continuation is worth learning from, not so strong that converting is hopeless.
+const PLAY_OUT_LEVEL = LEVELS[3];
+
 async function renderTrain() {
   let queue = buildQueue(S.games, S.analyses, S.progress, { now: Date.now() });
   if (!queue.length) {
@@ -1619,6 +1623,7 @@ async function renderTrain() {
 
   let pos = 0;
   let answered = false;
+  let tries = 0;
   let right = 0, wrong = 0;
 
   $('#view').innerHTML = `
@@ -1640,6 +1645,7 @@ async function renderTrain() {
   function show() {
     puzzle = queue[pos];
     answered = false;
+    tries = 0;
     const r = puzzle.record;
     chess = new Chess(r.fenBefore);
     board.setFlip(puzzle.myColor === 'b');
@@ -1655,6 +1661,9 @@ async function renderTrain() {
     $('#t-feedback').innerHTML = '';
   }
 
+  // Getting it wrong should send you back to the position, not hand you the
+  // answer. The spaced-repetition card is still graded on the FIRST try, so
+  // retrying to understand a position never inflates the schedule.
   async function attempt({ from, to }) {
     if (answered) return;
     let mv;
@@ -1662,53 +1671,86 @@ async function renderTrain() {
       mv = chess.move({ from, to, promotion: 'q' });
     } catch { return; }
     if (!mv) return;
-    answered = true;
+
+    tries++;
     board.setInteractive(false);
     board.position(chess.fen(), { lastMove: [from, to], arrows: [] });
 
     const r = puzzle.record;
     const best = r.bestUci;
-    const played = `${from}${to}`;
-    let correct = best && (played === best.slice(0, 4));
+    let correct = best && (`${from}${to}` === best.slice(0, 4));
     let verdict = '';
 
     if (correct) {
-      verdict = 'Exactly right.';
+      verdict = 'Right.';
     } else {
       $('#t-feedback').innerHTML = `<div class="card sub">Checking your move…</div>`;
       try {
         const eng = await getEngine();
-        // Must match the depth r.before was searched at, or the difference is
-        // mostly depth delta and a fine move gets graded wrong.
         const info = await eng.evalPosition(chess.fen(), puzzle.depth || S.depth);
-        // score is from the new side-to-move's view; flip to yours
         const mine = info.type === 'mate'
           ? (info.value > 0 ? -(MATE_CP - info.value) : MATE_CP + info.value)
           : -info.value;
         const lost = (r.mover === 'w' ? r.before : -r.before) - mine;
         if (isMateScore(mine) && mine < 0) {
-          verdict = `That runs into a forced mate in ${MATE_CP - Math.abs(mine)}.`;
+          verdict = `${mv.san} runs into a forced mate in ${MATE_CP - Math.abs(mine)}.`;
         } else if (lost <= NEAR_ENOUGH) {
           correct = true;
-          verdict = `Good move — the engine rates ${mv.san} about as highly as its own choice.`;
+          verdict = `Right — ${mv.san} is as good as the engine's own move.`;
         } else {
           verdict = `${mv.san} loses about ${(lost / 100).toFixed(1)} pawns.`;
         }
       } catch {
-        verdict = 'Not the move.';
+        verdict = `${mv.san} is not the move.`;
       }
     }
 
-    gradeCard(S.progress, puzzle.id, correct, Date.now());
-    await saveProgress(S.progress);
-    if (correct) right++; else wrong++;
-    $('#t-score').textContent = `${right} right · ${wrong} wrong`;
+    // Only the first attempt counts toward the ladder.
+    if (tries === 1) {
+      gradeCard(S.progress, puzzle.id, correct, Date.now());
+      await saveProgress(S.progress);
+      if (correct) right++; else wrong++;
+      $('#t-score').textContent = `${right} right · ${wrong} wrong`;
+    }
 
+    if (!correct) {
+      chess.undo();
+      board.position(chess.fen(), { lastMove: null, arrows: [] });
+      board.setInteractive(true, { legalFrom, onMove: attempt });
+      $('#t-feedback').innerHTML = `
+        <div class="card bad">
+          <h2>✗ ${esc(verdict)}</h2>
+          <p class="sub">Have another go — the position is back as it was.${
+            tries > 1 ? ` That's ${tries} tries.` : ''}</p>
+          <div class="row">
+            <button class="btn small" id="t-show">Show me the move</button>
+            <button class="btn small" id="t-skip">Skip this one</button>
+          </div>
+        </div>`;
+      $('#t-show').onclick = () => reveal();
+      $('#t-skip').onclick = () => nextPuzzle();
+      return;
+    }
+
+    answered = true;
+    await playOut(verdict);
+  }
+
+  /** Give up on this position: show the move and why the game move failed. */
+  function reveal() {
+    answered = true;
+    const r = puzzle.record;
     const bestSan = r.bestLine ? r.bestLine.replace(/^\d+\.+\s*/, '').split(' ')[0] : '?';
+    board.setInteractive(false);
+    if (r.bestUci) {
+      board.position(chess.fen(), {
+        lastMove: null,
+        arrows: [{ from: r.bestUci.slice(0, 2), to: r.bestUci.slice(2, 4), kind: 'best' }],
+      });
+    }
     $('#t-feedback').innerHTML = `
-      <div class="card ${correct ? 'good' : 'bad'}">
-        <h2>${correct ? '✓ ' : '✗ '}${esc(verdict)}</h2>
-        ${correct ? '' : `<p>The move was <b>${esc(bestSan)}</b>.</p>`}
+      <div class="card">
+        <h2>The move was <b>${esc(bestSan)}</b>.</h2>
         <p class="sub" style="margin-top:8px">In the game you played <b>${esc(r.san)}</b>:</p>
         <p class="why">${rich(explainMistake(r, puzzle.next))}</p>
         <div class="row">
@@ -1716,10 +1758,74 @@ async function renderTrain() {
           <a class="btn small" href="#g/${encodeURIComponent(puzzle.gameUuid)}">See the game</a>
         </div>
       </div>`;
-    $('#t-next').onclick = () => {
-      if (pos + 1 < queue.length) { pos++; show(); }
-      else location.hash = '';
+    $('#t-next').onclick = nextPuzzle;
+  }
+
+  /**
+   * Finding the move is half of it. Converting the position you just won is the
+   * half that actually shows up in your next game, so the engine keeps playing
+   * from here and you play it out rather than being handed a tick and a
+   * "next position" button.
+   */
+  async function playOut(verdict) {
+    const feedback = $('#t-feedback');
+    const renderPanel = (note) => {
+      feedback.innerHTML = `
+        <div class="card good">
+          <h2>✓ ${esc(verdict)}</h2>
+          <p class="sub">${esc(note)}</p>
+          <div class="row">
+            <button class="btn primary" id="t-next">${pos + 1 < queue.length ? 'Next position' : 'Finish'}</button>
+            <a class="btn small" href="#g/${encodeURIComponent(puzzle.gameUuid)}">See the game</a>
+          </div>
+        </div>`;
+      $('#t-next').onclick = nextPuzzle;
     };
+    renderPanel('Now play it out — the engine answers each move.');
+    await engineReply(renderPanel);
+  }
+
+  async function engineReply(renderPanel) {
+    const o = outcomeOf(chess);
+    if (o.over) {
+      renderPanel(`Game over — ${o.reason}.`);
+      board.setInteractive(false);
+      return;
+    }
+    board.setInteractive(false);
+    renderPanel('Thinking…');
+    let uci = null;
+    try {
+      uci = await engineMove(chess.fen(), PLAY_OUT_LEVEL);
+    } catch { /* fall through */ }
+    if (!uci) {
+      renderPanel('The engine stopped there. Take the next position when you are ready.');
+      return;
+    }
+    const mv = chess.move({ from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] || 'q' });
+    board.position(chess.fen(), { lastMove: [mv.from, mv.to], arrows: [] });
+    const after = outcomeOf(chess);
+    if (after.over) {
+      renderPanel(`Game over — ${after.reason}.`);
+      board.setInteractive(false);
+      return;
+    }
+    renderPanel('Your move.');
+    board.setInteractive(true, {
+      legalFrom,
+      onMove: async ({ from, to }) => {
+        let m;
+        try { m = chess.move({ from, to, promotion: 'q' }); } catch { return; }
+        if (!m) return;
+        board.position(chess.fen(), { lastMove: [from, to], arrows: [] });
+        await engineReply(renderPanel);
+      },
+    });
+  }
+
+  function nextPuzzle() {
+    if (pos + 1 < queue.length) { pos++; show(); }
+    else location.hash = '';
   }
 
   show();

@@ -23,6 +23,7 @@ class Engine {
     this.worker = new Worker(ENGINE_URL);
     this.lineHandler = null;
     this.appliedSkill = null;
+    this.appliedMultiPV = null;
     this.dead = false;
     this.queue = Promise.resolve();
     this.worker.onmessage = (e) => {
@@ -81,10 +82,11 @@ class Engine {
   // practice game against a weak level is still open in another view.
   evalPosition(fen, depth, opts = {}) {
     const skill = opts.skill == null ? DEFAULT_SKILL : opts.skill;
-    return this.enqueue(() => this.runEval(fen, depth, skill));
+    const multipv = opts.multipv > 1 ? Math.min(10, Math.floor(opts.multipv)) : 1;
+    return this.enqueue(() => this.runEval(fen, depth, skill, multipv));
   }
 
-  runEval(fen, depth, skill) {
+  runEval(fen, depth, skill, multipv) {
     return new Promise((resolve, reject) => {
       if (this.dead) {
         reject(new Error('engine stopped'));
@@ -94,7 +96,12 @@ class Engine {
         this.send(`setoption name Skill Level value ${skill}`);
         this.appliedSkill = skill;
       }
-      let best = null;
+      if (this.appliedMultiPV !== multipv) {
+        this.send(`setoption name MultiPV value ${multipv}`);
+        this.appliedMultiPV = multipv;
+      }
+      // One entry per MultiPV slot, each holding the deepest line seen for it.
+      const slots = new Map();
       const timer = setTimeout(() => {
         this.lineHandler = null;
         reject(new Error('engine timed out'));
@@ -103,11 +110,23 @@ class Engine {
         if (line.startsWith('info ') && line.includes(' pv ') && !/bound/.test(line)) {
           const sc = line.match(/ score (cp|mate) (-?\d+)/);
           const pv = line.match(/ pv (.+)$/);
-          if (sc && pv) best = { type: sc[1], value: parseInt(sc[2], 10), pv: pv[1].split(' ') };
+          if (!sc || !pv) return;
+          const idxM = line.match(/ multipv (\d+)/);
+          const idx = idxM ? parseInt(idxM[1], 10) : 1;
+          const dM = line.match(/ depth (\d+)/);
+          const d = dM ? parseInt(dM[1], 10) : 0;
+          const prev = slots.get(idx);
+          if (!prev || d >= prev.depth) {
+            slots.set(idx, { type: sc[1], value: parseInt(sc[2], 10), pv: pv[1].split(' '), depth: d });
+          }
         } else if (line.startsWith('bestmove')) {
           clearTimeout(timer);
           this.lineHandler = null;
-          resolve(best || { type: 'cp', value: 0, pv: [] });
+          const ordered = [...slots.entries()].sort((a, b) => a[0] - b[0]).map(([, v]) => v);
+          const top = ordered[0] || { type: 'cp', value: 0, pv: [], depth: 0 };
+          // `moves` carries every candidate the search kept, so callers that want
+          // a choice rather than the single best line have one.
+          resolve({ ...top, moves: ordered });
         }
       };
       this.send(`position fen ${fen}`);
