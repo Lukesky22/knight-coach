@@ -4,7 +4,7 @@
 // Strength comes from Stockfish's own Skill Level option plus a shallow search,
 // which is far more human than a full-strength engine told to move fast.
 
-import { getEngine, resetEngine } from './analysis.js';
+import { getEngine } from './analysis.js';
 
 export const LEVELS = [
   { id: 0, name: 'Beginner',     skill: 0,  depth: 1,  elo: '~400' },
@@ -15,29 +15,21 @@ export const LEVELS = [
   { id: 5, name: 'Full strength', skill: 20, depth: 14, elo: '2500+' },
 ];
 
-let appliedSkill = null;
-
 /** Ask the engine for a move at the given level. Returns a UCI string. */
 export async function engineMove(fen, level) {
   const eng = await getEngine();
-  if (appliedSkill !== level.skill) {
-    eng.send(`setoption name Skill Level value ${level.skill}`);
-    appliedSkill = level.skill;
-  }
-  const res = await eng.evalPosition(fen, level.depth);
+  // Skill Level travels with the request. It is no longer sticky global state on
+  // the shared worker, so abandoning a practice game mid-move cannot leave game
+  // review running at Skill Level 6 and writing weakened verdicts to the database.
+  const res = await eng.evalPosition(fen, level.depth, { skill: level.skill });
   return res.pv && res.pv.length ? res.pv[0] : null;
 }
 
 /**
- * Put the engine back to full strength. The same worker is shared with game
- * review, so leaving Skill Level at 3 would quietly weaken every analysis.
+ * Kept for callers that tidy up when a practice game ends. Strength is now
+ * per request, so there is no longer any engine state to put back.
  */
-export function releaseEngine() {
-  if (appliedSkill !== null && appliedSkill !== 20) {
-    resetEngine();
-    appliedSkill = null;
-  }
-}
+export function releaseEngine() {}
 
 /** A PGN the review pipeline can read back. */
 export function buildPgn({ sans, myColor, level, result }) {

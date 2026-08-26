@@ -9,10 +9,28 @@ const DRAW_CODES = new Set([
   'agreed', 'repetition', 'stalemate', 'insufficient', '50move', 'timevsinsufficient',
 ]);
 
-async function fetchJson(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Chess.com returned ${res.status} for ${url}`);
-  return res.json();
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Chess.com rate-limits bursts of archive requests. Retry those, and transient
+// server errors, instead of aborting a whole sync on one unlucky call.
+async function fetchJson(url, tries = 3) {
+  for (let attempt = 1; ; attempt++) {
+    let res;
+    try {
+      res = await fetch(url);
+    } catch (err) {
+      if (attempt >= tries) throw err;
+      await sleep(500 * attempt);
+      continue;
+    }
+    if (res.ok) return res.json();
+    const retryable = res.status === 429 || res.status >= 500;
+    if (!retryable || attempt >= tries) {
+      throw new Error(`Chess.com returned ${res.status} for ${url}`);
+    }
+    const after = parseInt(res.headers.get('retry-after') || '', 10);
+    await sleep(Number.isFinite(after) ? after * 1000 : 500 * attempt);
+  }
 }
 
 export function getProfile(user) {
@@ -34,10 +52,16 @@ export async function syncGames(user, onProgress) {
   for (let i = 0; i < archives.length; i++) {
     const url = archives[i];
     const key = url.slice(-7); // "YYYY/MM"
-    let month = key === currentKey ? null : await idbGet('months', `${user}|${key}`);
+    const isCurrent = key === currentKey;
+    const cached = await idbGet('months', `${user}|${key}`);
+    // A month cached while it was still in progress is a partial snapshot. It
+    // must be refetched once the month is over, or every game played after that
+    // last sync stays missing forever. `complete` marks the ones safe to trust.
+    let month = !isCurrent && cached && cached.complete ? cached : null;
     if (!month) {
       month = await fetchJson(url);
-      await idbPut('months', `${user}|${key}`, month);
+      // Still cached while current, so the offline fallback has this month too.
+      await idbPut('months', `${user}|${key}`, { ...month, complete: !isCurrent });
     }
     games.push(...(month.games || []));
     if (onProgress) onProgress(i + 1, archives.length);
