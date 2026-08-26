@@ -185,6 +185,26 @@ export async function evalWhite(fen, depth = 12) {
   return { cp: toWhiteView(info, fen.split(' ')[1]), pv: info.pv || [] };
 }
 
+// The accuracy number players know from chess.com-style reviews, computed the
+// way lichess documents it: centipawns become a win percentage, each move is
+// scored on how much win percentage it threw away, and the game is the average.
+// The exp() constant applies to win-percentage loss - feeding it raw centipawns
+// (an earlier bug here) returns ~0 for every normal game.
+const winPct = (cp) => 50 + 50 * (2 / (1 + Math.exp(-0.00368208 * cp)) - 1);
+
+export function gameAccuracy(records, color) {
+  const mine = records.filter((r) => r.mover === color);
+  if (!mine.length) return null;
+  const sign = color === 'w' ? 1 : -1;
+  let sum = 0;
+  for (const r of mine) {
+    const loss = Math.max(0, winPct(sign * r.before) - winPct(sign * r.after));
+    const acc = 103.1668100711649 * Math.exp(-0.04354415386753951 * loss) - 3.166924740191411 + 1;
+    sum += Math.max(0, Math.min(100, acc));
+  }
+  return sum / mine.length;
+}
+
 export function fmtEval(cp) {
   if (Math.abs(cp) >= MATE_CP - 500) {
     const n = MATE_CP - Math.abs(cp);

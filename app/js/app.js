@@ -5,7 +5,7 @@ import { getProfile, syncGames, loadCachedGames } from './chesscom.js';
 import { Board } from './board.js';
 import {
   analyzeGame, parseGame, fmtEval, isMateScore, explainMistake, dropDescription,
-  classify, severity, positionNotes, describeBestMove, evalWhite,
+  classify, severity, positionNotes, describeBestMove, evalWhite, gameAccuracy,
   VERDICT_LABEL, getEngine, MATE_CP, THRESHOLD,
 } from './analysis.js';
 import { buildQueue, gradeCard, getProgress, saveProgress, stats } from './trainer.js';
@@ -36,6 +36,7 @@ const S = {
   practice: [],        // games played in the app, kept alongside Chess.com ones
   playLevel: 2,
   playColor: 'w',
+  playCoach: true,     // live verdicts and retries while playing
 };
 
 const SEV_LABEL = { blunder: 'Blunder', mistake: 'Mistake', inaccuracy: 'Inaccuracy' };
@@ -330,7 +331,7 @@ function renderHome() {
         ${g.map((x) => {
           const a = S.analyses.get(x.uuid);
           const badge = a
-            ? `<span class="badge done">d${a.depth} · ${a.summary.counts.blunder}B ${a.summary.counts.mistake}M</span>`
+            ? `<span class="badge done">${Math.round(gameAccuracy(a.records, x.myColor) ?? 0)}% · ${a.summary.counts.blunder}B ${a.summary.counts.mistake}M</span>`
             : (x.rules === 'chess' ? '' : `<span class="badge">variant</span>`);
           return `
           <a class="game res-${x.resultForMe}" href="#g/${encodeURIComponent(x.uuid)}">
@@ -466,6 +467,22 @@ function renderGame(uuid) {
   const fenAt = (i) => (i === 0 ? startFen : moves[i - 1].after);
   const recAt = (i) => (analysis && i > 0 ? analysis.records[i - 1] : null);
   let playingLine = false; // true while the better line is being demonstrated
+
+  // How many opening plies stay inside known theory, chess.com-style "Book".
+  let bookPlies = 0;
+  loadBook().then(() => {
+    const sanList = moves.map((m) => m.san);
+    let n = 0;
+    while (n < Math.min(sanList.length, 24)) {
+      const conts = bookAt(sanList.slice(0, n)).continuations;
+      if (!conts.some((c) => c.san === sanList[n])) break;
+      n++;
+    }
+    bookPlies = n;
+    renderReview();
+  }).catch(() => { /* the review works without the book */ });
+
+  const bookNameAt = (i) => bookAt(moves.slice(0, i).map((m) => m.san)).name || 'a known line';
 
   function goTo(newIdx) {
     if (playingLine) return;
@@ -822,20 +839,26 @@ function renderGame(uuid) {
     const verdict = classify(rec);
     const isMine = rec.mover === g.myColor;
     const bad = ['inaccuracy', 'mistake', 'blunder', 'missed-win'].includes(verdict);
+    // theory moves get the neutral "Book" treatment instead of engine praise
+    const inBook = idx <= bookPlies && !bad;
+    const vClass = inBook ? 'book' : verdict;
+    const vLabel = inBook ? 'Book' : VERDICT_LABEL[verdict];
     const notes = positionNotes(fenAt(idx), g.myColor, Math.ceil(idx / 2));
     const nextRec = analysis.records[rec.i] || null;
 
     panel.innerHTML = `
-      <div class="card review-card ${verdict}">
+      <div class="card review-card ${vClass}">
         <div class="review-head">
           <div>
-            <span class="verdict ${verdict}">${VERDICT_LABEL[verdict]}</span>
+            <span class="verdict ${vClass}">${vLabel}</span>
             <b class="review-move">${esc(rec.label)} ${esc(rec.san)}</b>
           </div>
           <span class="sub">${isMine ? 'your move' : `${esc(g.oppName)}'s move`}</span>
         </div>
 
-        ${bad && isMine ? `
+        ${inBook ? `
+          <p class="why">Theory: <b>${esc(bookNameAt(idx))}</b>.</p>
+        ` : bad && isMine ? `
           <p class="why">${rich(explainMistake(rec, nextRec))}</p>
           <div class="legend">
             <span><i class="sw played"></i>what you played</span>
@@ -1077,8 +1100,9 @@ function renderGame(uuid) {
       <div class="card">
         <h2>Game report <span class="sub">depth ${analysis.depth}</span></h2>
         <div class="score-row">
+          <div class="score"><b>${(gameAccuracy(analysis.records, g.myColor) ?? 0).toFixed(1)}</b><span>accuracy</span></div>
           <div class="score"><b>${clean}%</b><span>clean moves</span></div>
-          <div class="score"><b>${analysis.summary.acpl}</b><span>avg centipawn loss</span></div>
+          <div class="score"><b>${analysis.summary.acpl}</b><span>avg cp loss</span></div>
         </div>
         <div class="tally">
           ${[['best', 'best'], ['excellent', 'excellent'], ['good', 'good'],
@@ -1162,6 +1186,12 @@ async function renderPlay() {
         <button class="btn small colour-pick ${myColor === 'w' ? 'on' : ''}" data-colour="w">Play White</button>
         <button class="btn small colour-pick ${myColor === 'b' ? 'on' : ''}" data-colour="b">Play Black</button>
       </div>
+      <div class="row" style="margin-top:10px">
+        <button class="btn small coach-pick ${S.playCoach ? 'on' : ''}" data-coach="1">Coach on</button>
+        <button class="btn small coach-pick ${S.playCoach ? '' : 'on'}" data-coach="">Coach off</button>
+      </div>
+      <p class="sub" style="margin-top:6px">Coach on: every move you play gets a verdict, you are warned
+      about threats and told the plan, and a blunder pauses the game so you can retry it — the review, live.</p>
       <button class="btn primary block" id="p-start">Start game</button>
     </div>
     <div id="p-game" hidden>
@@ -1179,6 +1209,9 @@ async function renderPlay() {
   for (const b of document.querySelectorAll('.colour-pick')) {
     b.onclick = () => { S.playColor = b.dataset.colour; renderPlay(); };
   }
+  for (const b of document.querySelectorAll('.coach-pick')) {
+    b.onclick = () => { S.playCoach = !!b.dataset.coach; renderPlay(); };
+  }
   $('#p-new').onclick = () => renderPlay();
 
   let board = null;
@@ -1188,6 +1221,17 @@ async function renderPlay() {
     $('#p-game').hidden = false;
     board = new Board($('#board'));
     board.setFlip(myColor === 'b');
+    if (S.playCoach) {
+      // The coached loop owns the board and its own take-back.
+      $('#p-undo').hidden = true;
+      runCoachedLoop({
+        board, chess, myColor, level,
+        panelEl: '#p-status',
+        stopWhen: () => !!finished,
+        onEnd: (o) => finish(o.reason, o.result),
+      });
+      return;
+    }
     draw();
     if (myColor === 'b') await engineTurn();
   };
@@ -1222,7 +1266,7 @@ async function renderPlay() {
     finished = {
       result,
       headline: drawn ? 'Drawn.' : iWon ? 'You won.' : 'You lost.',
-      detail: `By ${reason}. ${sans.length} moves played.`,
+      detail: `By ${reason}. ${chess.history().length} moves played.`,
     };
     releaseEngine();
     draw();
@@ -1276,7 +1320,9 @@ async function renderPlay() {
   };
 
   async function reviewPracticeGame(result) {
-    const pgn = buildPgn({ sans, myColor, level, result });
+    // history() is the source of truth: the coached loop takes moves back
+    // without touching the sans[] the uncoached path maintains.
+    const pgn = buildPgn({ sans: chess.history(), myColor, level, result });
     const uuid = `practice-${Date.now()}`;
     const game = {
       uuid, url: '', pgn, endTime: Math.floor(Date.now() / 1000),
@@ -1681,8 +1727,9 @@ async function renderDrill() {
 // words. Bad moves pause the game with the same explanation the review gives,
 // plus take-back-and-retry.
 
-async function runCoachedLoop({ board, chess, myColor, level, panelEl, footer = '', bindFooter, firstNote = '' }) {
-  const alive = () => document.contains(board.el);
+async function runCoachedLoop({ board, chess, myColor, level, panelEl, footer = '', bindFooter, firstNote = '', onEnd, stopWhen }) {
+  const alive = () => document.contains(board.el) && !(stopWhen && stopWhen());
+  let ended = false;
   const say = (html) => {
     if (!alive()) return;
     const el = $(panelEl);
@@ -1710,6 +1757,7 @@ async function runCoachedLoop({ board, chess, myColor, level, panelEl, footer = 
     const iWon = !drawn && (o.result === '1-0') === (myColor === 'w');
     say(`${note ? `<p class="why">${esc(note)}</p>` : ''}
       <h2>${drawn ? 'Drawn' : iWon ? 'You won' : 'You lost'} — ${esc(o.reason)}.</h2>`);
+    if (onEnd && !ended) { ended = true; onEnd(o); }
     return true;
   }
 

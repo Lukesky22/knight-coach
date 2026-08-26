@@ -256,6 +256,8 @@ polygon.arrow-played { fill: #c33; }
 .verdict.inaccuracy { color: var(--yellow); }
 .verdict.missed-win { color: #b06ce0; }
 .verdict.best, .verdict.excellent { color: var(--green); }
+.verdict.book { color: #c9a86a; }
+.review-card.book { border-left-color: #c9a86a; }
 
 .legend { display: flex; gap: 14px; margin: 8px 0; font-size: 0.78rem; color: var(--sub); }
 .legend .sw { display: inline-block; width: 14px; height: 3px; border-radius: 2px; margin-right: 5px; vertical-align: middle; }
