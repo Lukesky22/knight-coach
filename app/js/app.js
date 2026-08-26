@@ -9,7 +9,9 @@ import {
   VERDICT_LABEL, getEngine, MATE_CP, THRESHOLD,
 } from './analysis.js';
 import { buildQueue, gradeCard, getProgress, saveProgress, stats } from './trainer.js';
-import { loadBook, bookAt, bookExit, pickBookMove, habitReport, openingReport } from './openings.js';
+import {
+  loadBook, bookAt, bookExit, pickBookMove, habitReport, openingReport, recurringPositions,
+} from './openings.js';
 import {
   hasApiKey, getApiKey, setApiKey, clearApiKey,
   explainMove, cachedExplanation, getSpend, spendUsd,
@@ -91,7 +93,7 @@ function syncTabBar() {
   if (!bar) return;
   // hidden during setup and while reviewing a game, where the screen is
   // already full and the back arrow is the natural way out
-  const inGame = location.hash.startsWith('#g/') || location.hash === '#drill';
+  const inGame = location.hash.startsWith('#g/') || location.hash === '#drill' || location.hash === '#situ';
   bar.hidden = !S.user || inGame;
   for (const a of bar.querySelectorAll('a')) {
     a.classList.toggle('on', a.dataset.tab === (location.hash || ''));
@@ -106,6 +108,7 @@ function route() {
   else if (location.hash === '#train') renderTrain();
   else if (location.hash === '#openings') renderOpenings();
   else if (location.hash === '#drill') renderDrill();
+  else if (location.hash === '#situ') renderSitu();
   else if (location.hash === '#settings') renderSettings();
   else if (location.hash === '#play') renderPlay();
   else renderHome();
@@ -1421,6 +1424,7 @@ async function renderOpenings() {
   await loadBook();
   const habits = habitReport(S.games);
   const report = openingReport(S.games, S.analyses);
+  const situs = recurringPositions(S.games);
 
   // Where do YOU leave known theory, and what does the book play instead?
   // Group identical departures so a habit shows up as a repeated one.
@@ -1472,6 +1476,23 @@ async function renderOpenings() {
         ? `<p class="why">Fix these first: <b>${failing.map((h) => esc(h.label.toLowerCase())).join(', ')}</b>.</p>`
         : `<p class="why">Your opening habits are sound. Theory is worth studying now.</p>`}
     </div>
+
+    ${situs.length ? `
+    <div class="card">
+      <h2>Your recurring positions</h2>
+      <p class="sub">Mined from your own games: the exact positions you keep landing in,
+      worst-scoring first. Practice them until they stop costing you points.</p>
+      ${situs.map((s, i) => `
+        <div class="situ-row">
+          <div class="situ-info">
+            <b>…${esc(s.path.slice(-4).join(' '))}</b>
+            <div class="sub">${s.count} games as ${s.color === 'w' ? 'White' : 'Black'} ·
+              you score ${Math.round(s.score * 100)}% ·
+              you usually play ${esc(s.usual.map(([m, n]) => `${m} (${n}×)`).join(', '))}</div>
+          </div>
+          <button class="btn small situ-go" data-i="${i}">Practice</button>
+        </div>`).join('')}
+    </div>` : ''}
 
     <div class="card">
       <div class="row-between"><h2>Drill your openings</h2></div>
@@ -1530,6 +1551,46 @@ async function renderOpenings() {
   for (const b of document.querySelectorAll('.drill-pick')) {
     b.onclick = () => { S.drillFamily = b.dataset.family; location.hash = '#drill'; };
   }
+  for (const b of document.querySelectorAll('.situ-go')) {
+    b.onclick = () => { S.situ = situs[+b.dataset.i]; location.hash = '#situ'; };
+  }
+}
+
+// ---------------------------------------------------------------- your positions
+
+// Practice one of the positions mined from your own games, against the engine,
+// with the coached loop judging every move.
+function renderSitu() {
+  const s = S.situ;
+  if (!s) { location.hash = '#openings'; return; }
+
+  $('#view').innerHTML = `
+    <header class="top">
+      <a class="btn small" href="#openings">←</a>
+      <div><h1>Your position</h1><div class="sub">${esc(s.path.join(' '))}</div></div>
+      <span></span>
+    </header>
+    <div class="card">
+      <p class="sub">You have reached this exact position <b>${s.count} times</b> and scored
+      <b>${Math.round(s.score * 100)}%</b> from it. You usually play
+      <b>${esc(s.usual.map(([m, n]) => `${m} (${n}×)`).join(', '))}</b>.
+      Play it out — the engine answers, every move gets a verdict. Use Hint if you want
+      to see what it would play here.</p>
+    </div>
+    <div class="board-wrap"><div id="board"></div></div>
+    <div id="s-feedback"></div>`;
+
+  const board = new Board($('#board'));
+  board.setFlip(s.color === 'b');
+  const chess = new Chess(s.fen);
+  const footer = `<div class="row" style="margin-top:8px">
+    <button class="btn small" id="s-again">Play it again</button>
+    <a class="btn small" href="#openings">Back</a></div>`;
+  const bind = () => { const b = $('#s-again'); if (b) b.onclick = () => renderSitu(); };
+  runCoachedLoop({
+    board, chess, myColor: s.color, level: LEVELS[2],
+    panelEl: '#s-feedback', footer, bindFooter: bind,
+  });
 }
 
 // ---------------------------------------------------------------- opening drill

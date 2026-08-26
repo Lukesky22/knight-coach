@@ -129,6 +129,70 @@ export function bookExit(sans, color = null, maxPly = 24) {
   return null;
 }
 
+// ---------------------------------------------------------------- recurring positions
+
+/**
+ * The positions this player actually keeps reaching, mined from their own
+ * games. Generic theory drills teach lines; these are the crossroads of their
+ * real chess life - "you have been here 14 times and score 32%".
+ *
+ * Keys merge transpositions (board + turn + castling, counters stripped), and
+ * a shallow crossroads that nearly always leads to a kept deeper one is
+ * absorbed by it: the deeper position IS the situation, told more precisely.
+ */
+export function recurringPositions(games, { minCount = 4, maxPly = 14, top = 10 } = {}) {
+  const map = new Map();
+  for (const g of games) {
+    if (g.rules && g.rules !== 'chess') continue;
+    let hist;
+    try {
+      const c = new Chess();
+      c.loadPgn(g.pgn);
+      hist = c.history({ verbose: true });
+    } catch { continue; }
+    const replay = new Chess();
+    for (let ply = 0; ply < Math.min(hist.length, maxPly); ply++) {
+      if (replay.turn() === g.myColor && ply >= 3) {
+        const parts = replay.fen().split(' ');
+        const key = `${parts[0]} ${parts[1]} ${parts[2]}`;
+        let e = map.get(key);
+        if (!e) {
+          e = {
+            key, fen: replay.fen(), color: g.myColor, ply,
+            path: hist.slice(0, ply).map((m) => m.san),
+            count: 0, W: 0, L: 0, D: 0, moves: new Map(),
+          };
+          map.set(key, e);
+        }
+        e.count++;
+        e[g.resultForMe]++;
+        const played = hist[ply].san;
+        e.moves.set(played, (e.moves.get(played) || 0) + 1);
+      }
+      replay.move(hist[ply].san);
+    }
+  }
+
+  const cands = [...map.values()].filter((e) => e.count >= minCount);
+  cands.sort((a, b) => b.ply - a.ply || b.count - a.count);
+  const kept = [];
+  for (const e of cands) {
+    const absorbed = kept.some((k) =>
+      k.ply > e.ply
+      && k.path.slice(0, e.ply).join(' ') === e.path.join(' ')
+      && k.count >= 0.7 * e.count);
+    if (!absorbed) kept.push(e);
+  }
+  for (const e of kept) {
+    e.score = (e.W + e.D / 2) / e.count;
+    // how much this position hurts: often reached, badly scored
+    e.pain = e.count * (1 - e.score);
+    e.usual = [...e.moves.entries()].sort((x, y) => y[1] - x[1]).slice(0, 2);
+  }
+  kept.sort((a, b) => b.pain - a.pain);
+  return kept.slice(0, top);
+}
+
 // ---------------------------------------------------------------- principles
 
 const HOME = {

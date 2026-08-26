@@ -367,6 +367,14 @@ polygon.arrow-played { fill: #c33; }
 .habit.bad b::before { content: '! '; color: var(--orange); }
 
 .drill-picks { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+.situ-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  padding: 9px 0; border-bottom: 1px solid #232936;
+}
+.situ-row:last-child { border-bottom: none; }
+.situ-info { min-width: 0; }
+.situ-info b { font-size: 0.9rem; }
+.situ-info .sub { font-size: 0.75rem; }
 .btn.on { border-color: var(--accent); color: var(--accent); }
 .btn i.sub { font-style: normal; margin-left: 5px; }
 .opening-block { padding: 10px 0; border-bottom: 1px solid #232936; }
