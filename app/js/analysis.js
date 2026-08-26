@@ -174,6 +174,17 @@ function toWhiteView(res, stm) {
   return stm === 'w' ? v : -v;
 }
 
+/**
+ * One-call judgement of a position: White-viewpoint centipawns plus the
+ * engine's line from here. Every view that wants live coaching needs exactly
+ * this pair, and the side-to-move sign flip has caused bugs when hand-rolled.
+ */
+export async function evalWhite(fen, depth = 12) {
+  const eng = await getEngine();
+  const info = await eng.evalPosition(fen, depth);
+  return { cp: toWhiteView(info, fen.split(' ')[1]), pv: info.pv || [] };
+}
+
 export function fmtEval(cp) {
   if (Math.abs(cp) >= MATE_CP - 500) {
     const n = MATE_CP - Math.abs(cp);

@@ -5,7 +5,8 @@ import { getProfile, syncGames, loadCachedGames } from './chesscom.js';
 import { Board } from './board.js';
 import {
   analyzeGame, parseGame, fmtEval, isMateScore, explainMistake, dropDescription,
-  classify, positionNotes, VERDICT_LABEL, getEngine, MATE_CP, THRESHOLD,
+  classify, severity, positionNotes, describeBestMove, evalWhite,
+  VERDICT_LABEL, getEngine, MATE_CP, THRESHOLD,
 } from './analysis.js';
 import { buildQueue, gradeCard, getProgress, saveProgress, stats } from './trainer.js';
 import { loadBook, bookAt, bookExit, pickBookMove, habitReport, openingReport } from './openings.js';
@@ -1533,13 +1534,15 @@ async function renderDrill() {
       done = true;
       board.setInteractive(false);
       $('#d-prompt').innerHTML = `<h2>${esc(info.name || 'Out of book')}</h2>
-        <p class="sub">This is as far as the book goes. From here it is your own chess.</p>`;
+        <p class="sub">This is as far as the book goes.</p>`;
       $('#d-feedback').innerHTML = `<div class="card">
         <p>You played: <b>${esc(sans.join(' ')) || '(nothing)'}</b></p>
         <div class="row">
-          <button class="btn primary" id="d-again">Start again</button>
-          <a class="btn small" href="#openings">Back to openings</a>
+          <button class="btn primary" id="d-continue">Keep playing — coached</button>
+          <button class="btn small" id="d-again">Start again</button>
+          <a class="btn small" href="#openings">Back</a>
         </div></div>`;
+      $('#d-continue').onclick = () => startFreePlay();
       $('#d-again').onclick = () => renderDrill();
       return;
     }
@@ -1555,13 +1558,38 @@ async function renderDrill() {
 
   function replyFromBook() {
     const pick = pickBookMove(sans, family);
-    if (!pick || !chess.moves().includes(pick.san)) { done = true; return; }
+    if (!pick || !chess.moves().includes(pick.san)) { done = true; return null; }
+    const fenBefore = chess.fen();
+    const mover = chess.turn();
     const mv = chess.move(pick.san);
     sans.push(mv.san);
     lastFromTo = [mv.from, mv.to];
+    // "brings a new piece into the game", "takes space in the centre", ...
+    const raw = describeBestMove({
+      fenBefore, mover, bestUci: `${mv.from}${mv.to}${mv.promotion || ''}`,
+    });
+    const idea = raw.replace(/^\*\*.+?\*\* was the move: it /, '').replace(/\.$/, '');
+    return { san: mv.san, idea: idea === raw ? '' : idea };
   }
 
-  function attempt({ from, to }) {
+  // Once a line leaves the book, the coached loop takes over: the engine plays
+  // the other side and every move of yours gets a verdict.
+  function startFreePlay() {
+    done = true;
+    $('#d-prompt').innerHTML = `<h2>${esc(bookAt(sans).name || family || 'Your game')}</h2>
+      <p class="sub">Out of the book — now it is chess. The engine answers, and every move
+      of yours gets a verdict. Mistakes pause the game so you can retry them.</p>`;
+    const footer = `<div class="row" style="margin-top:8px">
+      <button class="btn small" id="d-again2">Start again</button>
+      <a class="btn small" href="#openings">Back to openings</a></div>`;
+    const bind = () => { const b = $('#d-again2'); if (b) b.onclick = () => renderDrill(); };
+    runCoachedLoop({
+      board, chess, myColor, level: LEVELS[3],
+      panelEl: '#d-feedback', footer, bindFooter: bind,
+    });
+  }
+
+  async function attempt({ from, to }) {
     if (done) return;
     // Work out the book moves while the position is still the one being asked
     // about; playing first would leave chess.moves() listing the opponent's
@@ -1573,23 +1601,69 @@ async function renderDrill() {
 
     const ok = options.includes(mv.san);
     if (!ok) {
+      // Off the book path. The book only knows NAMED moves, so ask the engine
+      // whether the move is actually bad before saying anything discouraging.
+      board.setInteractive(false);
+      $('#d-feedback').innerHTML = `<div class="card"><p class="sub">Not a book move — asking the engine what it thinks…</p></div>`;
+      const fenAfter = chess.fen();
       chess.undo();
-      draw(`<div class="card bad">
-        <h2>✗ ${esc(mv.san)} is not in the book here.</h2>
-        <p>Theory plays: <b>${options.slice(0, 4).map(esc).join(', ')}</b>.</p>
-        <p class="sub">That does not make your move losing — it just leaves known paths, and at your level that usually means facing prepared opponents without a map.</p>
-      </div>`);
+      const fenBefore = chess.fen();
+      let beforeEv, afterEv;
+      try {
+        beforeEv = await evalWhite(fenBefore, 12);
+        afterEv = await evalWhite(fenAfter, 12);
+      } catch {
+        draw(`<div class="card bad"><h2>✗ ${esc(mv.san)} is not in the book here.</h2>
+          <p>Theory plays: <b>${options.slice(0, 4).map(esc).join(', ')}</b>.</p></div>`);
+        return;
+      }
+      if (!document.contains(board.el)) return;
+      const drop = myColor === 'w' ? beforeEv.cp - afterEv.cp : afterEv.cp - beforeEv.cp;
+
+      if (drop >= THRESHOLD) {
+        const rec = {
+          label: '', san: mv.san, mover: myColor, before: beforeEv.cp, after: afterEv.cp,
+          drop, fenBefore, played: { from, to }, bestUci: beforeEv.pv[0] || null, bestLine: '',
+        };
+        const next = { fenBefore: fenAfter, bestUci: afterEv.pv[0] || null, bestLine: '' };
+        draw(`<div class="card bad">
+          <h2>✗ ${esc(mv.san)} is not book — and it loses material.</h2>
+          <p class="why">${rich(explainMistake(rec, next))}</p>
+          <p>Theory plays <b>${options.slice(0, 3).map(esc).join(', ')}</b>. The position is back — try one.</p>
+        </div>`);
+        return;
+      }
+
+      // Sound, just unnamed. That is a real choice, not an error.
+      board.setInteractive(false);
+      $('#d-feedback').innerHTML = `<div class="card">
+        <h2>${esc(mv.san)} is not in the book, but it is a fine move.</h2>
+        <p class="sub">The engine says it costs ${drop <= 0 ? 'nothing at all' : `only ${(drop / 100).toFixed(1)} pawns`}.
+        Theory prefers <b>${options.slice(0, 3).map(esc).join(', ')}</b>. Your call:</p>
+        <div class="row">
+          <button class="btn small primary" id="d-playit">Play it — coached from here</button>
+          <button class="btn small" id="d-stay">Take back, stay in theory</button>
+        </div></div>`;
+      $('#d-playit').onclick = () => {
+        chess.move({ from, to, promotion: 'q' });
+        sans.push(mv.san);
+        lastFromTo = [from, to];
+        startFreePlay();
+      };
+      $('#d-stay').onclick = () => draw();
       return;
     }
+
     sans.push(mv.san);
     lastFromTo = [mv.from, mv.to];
     const named = bookAt(sans);
     board.setInteractive(false);
     // book plays its reply
     setTimeout(() => {
-      replyFromBook();
+      const reply = replyFromBook();
       draw(`<div class="card good"><h2>✓ ${esc(mv.san)}</h2>
-        <p class="sub">${esc(named.name || 'Still in book')}.</p></div>`);
+        <p class="sub">${esc(named.name || 'Still in book')}.${
+          reply ? ` Book answers <b>${esc(reply.san)}</b>${reply.idea ? ` — ${esc(reply.idea)}` : ''}.` : ''}</p></div>`);
     }, 350);
   }
 
@@ -1599,6 +1673,174 @@ async function renderDrill() {
 }
 
 // ---------------------------------------------------------------- trainer
+
+// ---------------------------------------------------------------- coached play
+//
+// The loop that makes Train and Openings feel like the game review: you keep
+// playing, the engine answers, and every move of yours gets a verdict in plain
+// words. Bad moves pause the game with the same explanation the review gives,
+// plus take-back-and-retry.
+
+async function runCoachedLoop({ board, chess, myColor, level, panelEl, footer = '', bindFooter, firstNote = '' }) {
+  const alive = () => document.contains(board.el);
+  const say = (html) => {
+    if (!alive()) return;
+    const el = $(panelEl);
+    if (el) {
+      el.innerHTML = `<div class="card">${html}${footer}</div>`;
+      if (bindFooter) bindFooter();
+    }
+  };
+
+  let cp = null, pv = []; // white-view eval + engine line for the user-to-move position
+  let note = firstNote;   // one-liner about the user's previous move
+
+  const lastFromTo = () => {
+    const h = chess.history({ verbose: true });
+    return h.length ? [h[h.length - 1].from, h[h.length - 1].to] : null;
+  };
+  const redraw = (arrows = []) => board.position(chess.fen(), { lastMove: lastFromTo(), arrows });
+  const legalFrom = (sq) => chess.moves({ square: sq, verbose: true }).map((m) => m.to);
+
+  function gameOverCard() {
+    const o = outcomeOf(chess);
+    if (!o.over) return false;
+    board.setInteractive(false);
+    const drawn = o.result === '1/2-1/2';
+    const iWon = !drawn && (o.result === '1-0') === (myColor === 'w');
+    say(`${note ? `<p class="why">${esc(note)}</p>` : ''}
+      <h2>${drawn ? 'Drawn' : iWon ? 'You won' : 'You lost'} — ${esc(o.reason)}.</h2>`);
+    return true;
+  }
+
+  function standingText() {
+    const u = myColor === 'w' ? cp : -cp;
+    if (isMateScore(cp)) {
+      return u > 0 ? 'You have a forced mate — finish it.' : 'You are getting mated — defend.';
+    }
+    if (Math.abs(u) < 30) return 'The position is level.';
+    return `${(Math.abs(u) / 100).toFixed(1)} pawns ${u > 0 ? 'in your favour' : 'against you'}.`;
+  }
+
+  function yourTurn(headline = '') {
+    if (!alive() || gameOverCard()) return;
+    const fullmove = parseInt(chess.fen().split(' ')[5], 10);
+    const warn = positionNotes(chess.fen(), myColor, fullmove).find((n) => n.kind === 'warn');
+    say(`
+      ${note ? `<p class="why">${esc(note)}</p>` : ''}
+      ${headline || '<h2>Your move.</h2>'}
+      ${cp !== null ? `<p class="sub">${esc(standingText())}</p>` : ''}
+      ${warn ? `<div class="note warn">${esc(warn.text)}</div>` : ''}
+      <div class="row">
+        <button class="btn small" id="cl-hint">Hint</button>
+        <button class="btn small" id="cl-back" ${chess.history().length >= 2 ? '' : 'disabled'}>Take back</button>
+      </div>`);
+    note = '';
+    const hint = $('#cl-hint');
+    if (hint) hint.onclick = () => {
+      if (pv[0]) redraw([{ from: pv[0].slice(0, 2), to: pv[0].slice(2, 4), kind: 'best' }]);
+    };
+    const back = $('#cl-back');
+    if (back) back.onclick = () => {
+      if (chess.history().length >= 2) { chess.undo(); chess.undo(); }
+      redraw();
+      startTurn('<h2>Back a move — try again.</h2>');
+    };
+    board.setInteractive(true, { legalFrom, onMove: userMove });
+  }
+
+  async function startTurn(headline = '') {
+    say(`${note ? `<p class="why">${esc(note)}</p>` : ''}<p class="sub">Reading the position…</p>`);
+    try {
+      const r = await evalWhite(chess.fen(), 12);
+      cp = r.cp; pv = r.pv;
+    } catch { /* coach silently sits out this move */ }
+    yourTurn(headline);
+  }
+
+  async function userMove({ from, to }) {
+    const fenBefore = chess.fen();
+    const baseCp = cp, basePv = pv;
+    let mv;
+    try { mv = chess.move({ from, to, promotion: 'q' }); } catch { return; }
+    if (!mv) return;
+    redraw();
+    board.setInteractive(false);
+    if (gameOverCard()) return;
+
+    say('<p class="sub">Checking your move…</p>');
+    let after;
+    try {
+      after = await evalWhite(chess.fen(), 12);
+    } catch {
+      if (alive()) opponentTurn();
+      return;
+    }
+    if (!alive()) return;
+    const drop = baseCp === null ? 0 : (myColor === 'w' ? baseCp - after.cp : after.cp - baseCp);
+
+    if (drop >= THRESHOLD) {
+      // Pause and coach, exactly like the review card would.
+      const rec = {
+        label: '', san: mv.san, mover: myColor, before: baseCp, after: after.cp,
+        drop, fenBefore, played: { from, to }, bestUci: basePv[0] || null, bestLine: '',
+      };
+      const sev = severity(rec) || 'mistake';
+      const next = { fenBefore: chess.fen(), bestUci: after.pv[0] || null, bestLine: '' };
+      redraw(after.pv[0]
+        ? [{ from: after.pv[0].slice(0, 2), to: after.pv[0].slice(2, 4), kind: 'played' }]
+        : []);
+      say(`
+        <div class="review-head">
+          <span class="verdict ${sev}">${VERDICT_LABEL[sev] || 'Mistake'}</span>
+          <b class="review-move">${esc(mv.san)}</b>
+        </div>
+        <p class="why">${rich(explainMistake(rec, next))}</p>
+        ${next.bestUci ? '<p class="sub">Red shows how it gets punished.</p>' : ''}
+        <div class="row">
+          <button class="btn small primary" id="cl-retry">Take back & retry</button>
+          <button class="btn small" id="cl-goon">Play on anyway</button>
+        </div>`);
+      const retry = $('#cl-retry');
+      if (retry) retry.onclick = () => {
+        chess.undo();
+        cp = baseCp; pv = basePv;
+        redraw();
+        yourTurn('<h2>Same position — find a better move.</h2>');
+      };
+      const goon = $('#cl-goon');
+      if (goon) goon.onclick = () => { cp = after.cp; pv = after.pv; opponentTurn(); };
+      return;
+    }
+
+    cp = after.cp; pv = after.pv;
+    const playedBest = basePv[0] && `${from}${to}` === basePv[0].slice(0, 4);
+    note = playedBest ? `★ ${mv.san} — the engine's own choice.`
+      : drop <= 20 ? `✓ ${mv.san} — good.`
+      : `${mv.san} is okay, but gives back ${(Math.max(0, drop) / 100).toFixed(1)} pawns.`;
+    opponentTurn();
+  }
+
+  async function opponentTurn() {
+    if (!alive() || gameOverCard()) return;
+    say(`${note ? `<p class="why">${esc(note)}</p>` : ''}<p class="sub">Engine is replying…</p>`);
+    let uci = null;
+    try { uci = await engineMove(chess.fen(), level); } catch { /* fall through */ }
+    if (!alive()) return;
+    if (!uci || !chess.move({ from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] || 'q' })) {
+      startTurn();
+      return;
+    }
+    redraw();
+    if (gameOverCard()) return;
+    startTurn();
+  }
+
+  redraw();
+  if (gameOverCard()) return;
+  if (chess.turn() !== myColor) await opponentTurn();
+  else await startTurn();
+}
 
 // A puzzle has one engine answer, but chess usually offers several good moves.
 // Accept anything that keeps the evaluation within this many centipawns.
@@ -1644,6 +1886,7 @@ async function renderTrain() {
 
   function show() {
     puzzle = queue[pos];
+    window.__kcPuzzle = puzzle; // debug/test hook, carries no secrets
     answered = false;
     tries = 0;
     const r = puzzle.record;
@@ -1763,63 +2006,21 @@ async function renderTrain() {
 
   /**
    * Finding the move is half of it. Converting the position you just won is the
-   * half that actually shows up in your next game, so the engine keeps playing
-   * from here and you play it out rather than being handed a tick and a
-   * "next position" button.
+   * half that actually shows up in your next game, so the coached loop takes
+   * over from here: the engine answers each move and every one of yours gets a
+   * verdict, exactly like the game review.
    */
   async function playOut(verdict) {
-    const feedback = $('#t-feedback');
-    const renderPanel = (note) => {
-      feedback.innerHTML = `
-        <div class="card good">
-          <h2>✓ ${esc(verdict)}</h2>
-          <p class="sub">${esc(note)}</p>
-          <div class="row">
-            <button class="btn primary" id="t-next">${pos + 1 < queue.length ? 'Next position' : 'Finish'}</button>
-            <a class="btn small" href="#g/${encodeURIComponent(puzzle.gameUuid)}">See the game</a>
-          </div>
-        </div>`;
-      $('#t-next').onclick = nextPuzzle;
-    };
-    renderPanel('Now play it out — the engine answers each move.');
-    await engineReply(renderPanel);
-  }
-
-  async function engineReply(renderPanel) {
-    const o = outcomeOf(chess);
-    if (o.over) {
-      renderPanel(`Game over — ${o.reason}.`);
-      board.setInteractive(false);
-      return;
-    }
-    board.setInteractive(false);
-    renderPanel('Thinking…');
-    let uci = null;
-    try {
-      uci = await engineMove(chess.fen(), PLAY_OUT_LEVEL);
-    } catch { /* fall through */ }
-    if (!uci) {
-      renderPanel('The engine stopped there. Take the next position when you are ready.');
-      return;
-    }
-    const mv = chess.move({ from: uci.slice(0, 2), to: uci.slice(2, 4), promotion: uci[4] || 'q' });
-    board.position(chess.fen(), { lastMove: [mv.from, mv.to], arrows: [] });
-    const after = outcomeOf(chess);
-    if (after.over) {
-      renderPanel(`Game over — ${after.reason}.`);
-      board.setInteractive(false);
-      return;
-    }
-    renderPanel('Your move.');
-    board.setInteractive(true, {
-      legalFrom,
-      onMove: async ({ from, to }) => {
-        let m;
-        try { m = chess.move({ from, to, promotion: 'q' }); } catch { return; }
-        if (!m) return;
-        board.position(chess.fen(), { lastMove: [from, to], arrows: [] });
-        await engineReply(renderPanel);
-      },
+    const footer = `
+      <div class="row" style="margin-top:8px">
+        <button class="btn primary" id="t-next">${pos + 1 < queue.length ? 'Next position' : 'Finish'}</button>
+        <a class="btn small" href="#g/${encodeURIComponent(puzzle.gameUuid)}">See the game</a>
+      </div>`;
+    const bind = () => { const n = $('#t-next'); if (n) n.onclick = nextPuzzle; };
+    await runCoachedLoop({
+      board, chess, myColor: puzzle.myColor, level: PLAY_OUT_LEVEL,
+      panelEl: '#t-feedback', footer, bindFooter: bind,
+      firstNote: `✓ ${verdict} Now play it out.`,
     });
   }
 
