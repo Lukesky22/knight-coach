@@ -1,5 +1,7 @@
 node_modules/
 files.zip
+*.patch
+_to_delete/
 *_review.md
 __pycache__/
 .DS_Store
